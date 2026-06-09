@@ -151,6 +151,45 @@ def aggregate_site_profile(url: str, pages: list) -> dict:
     }
 
 
+def build_page_profile(page: dict, base_url: str) -> dict:
+    """Normalize a single page snapshot into a page-specific profile."""
+    page_url = normalize_url(page.get("page_url") or base_url)
+    title = page.get("title") or "Untitled Page"
+    links = page.get("links", []) or []
+    forms = page.get("forms", []) or []
+    headings = page.get("headings", []) or []
+    meta_tags = page.get("meta_tags", {}) or {}
+    images = page.get("images", []) or []
+    html_snippet = page.get("html_snippet", "") or ""
+    status_code = page.get("status_code", 200)
+
+    return {
+        "page_url": page_url,
+        "title": title,
+        "links": links,
+        "link_count": len(links),
+        "link_texts": [link.get("text", "").strip() for link in links if link.get("text", "").strip()],
+        "forms": forms,
+        "form_count": len(forms),
+        "form_field_names": [
+            (field.get("name") or field.get("placeholder") or field.get("type", "field"))
+            for form in forms
+            for field in form.get("inputs", []) or []
+        ],
+        "headings": headings,
+        "heading_count": len(headings),
+        "has_h1": any(h.lower().startswith("h1:") for h in headings),
+        "meta_tags": meta_tags,
+        "meta_count": len(meta_tags),
+        "html_length": page.get("html_length", len(html_snippet)),
+        "html_snippet": html_snippet,
+        "status_code": status_code,
+        "image_count": len(images),
+        "images_missing_alt": sum(1 for image in images if not image.get("has_alt")),
+        "is_blocked": any(marker in title.lower() or marker in html_snippet.lower() for marker in BLOCKED_PAGE_MARKERS),
+    }
+
+
 def scan_codebase(codebase_path: str) -> dict:
     """Collect lightweight project metadata for test planning and code mapping."""
     ignored_dirs = {
@@ -465,7 +504,7 @@ def crawl_website(url: str) -> dict:
 
 
 def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
-    """Generate site-specific test cases; pass/fail is decided during live browser execution."""
+    """Generate page-specific test cases; pass/fail is decided during live browser execution."""
     profile = aggregate_site_profile(url, pages)
     domain = profile["domain"]
     page_url = profile["url"]
@@ -486,9 +525,10 @@ def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
             "check_type": check_type,
         }
 
+    # Always keep one site-level entry, but page-specific checks are added below.
     use_cases.append({
         "title": f"Site Availability — {domain}",
-        "description": f"Verify that '{title}' loads correctly at {page_url}.",
+        "description": f"Verify that the submitted site and its discovered pages load correctly.",
         "test_cases": [
             pending_test(
                 f"HTTP Status for '{title}'",
@@ -513,91 +553,89 @@ def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
             "priority": "critical",
         })
 
-    if profile["link_count"] > 0:
-        sample_text = ", ".join(profile["link_texts"][:3]) or "navigation links"
-        nav_tests = [
+    # Build a page-by-page view so every discovered screen gets its own targeted checks.
+    for page in pages or []:
+        page_profile = build_page_profile(page, page_url)
+        page_title = page_profile["title"]
+        page_specific_cases = [
             pending_test(
-                f"Link Health Check ({profile['link_count']} links on {domain})",
-                f"1. Sample up to 8 links from {domain} ({sample_text})\n2. Verify each responds with HTTP < 400\n3. Flag broken links",
-                "Navigation links should resolve without client or server errors.",
-                "link_health",
-            )
-        ]
-        if profile["page_count"] > 1:
-            nav_tests.append(
-                pending_test(
-                    f"Internal Discovery — {profile['page_count']} pages on {domain}",
-                    f"1. Crawl from {page_url}\n2. Verify {profile['page_count']} same-domain pages were found\n3. Spot-check reachability",
-                    "Multiple internal pages should be discoverable from the start URL.",
-                    "internal_pages",
-                )
-            )
-        use_cases.append({
-            "title": f"Navigation on {domain} — {profile['link_count']} links",
-            "description": f"Validate links discovered on '{title}'.",
-            "test_cases": nav_tests,
-        })
-    elif not profile["is_blocked"]:
-        use_cases.append({
-            "title": f"Navigation Gap on {domain}",
-            "description": f"No anchor links found on '{title}'.",
-            "test_cases": [
-                pending_test(
-                    f"Missing Navigation on '{title}'",
-                    f"1. Scan {page_url}\n2. Search for anchor navigation\n3. Confirm crawlability",
-                    "Homepage should expose at least one navigational link.",
-                    "navigation_presence",
-                )
-            ],
-        })
-
-    if profile["form_count"] > 0:
-        field_count = len(profile["form_field_names"])
-        field_label = ", ".join(profile["form_field_names"][:4]) or "form fields"
-        use_cases.append({
-            "title": f"Forms on {domain} — {profile['form_count']} form(s), {field_count} fields",
-            "description": f"Validate forms and fields ({field_label}) on '{title}'.",
-            "test_cases": [
-                pending_test(
-                    f"Required Field Validation - {field_count} Fields",
-                    f"1. Locate forms on {domain}\n2. Inspect fields: {field_label}\n3. Verify required attributes",
-                    "Required inputs should be marked and enforced before submission.",
-                    "form_required",
-                )
-            ],
-        })
-
-    use_cases.append({
-        "title": f"Content & SEO Structure — {title}",
-        "description": f"Evaluate headings, meta tags, and content depth on {domain}.",
-        "test_cases": [
+                f"Load {page_title}",
+                f"1. Navigate to {page_profile['page_url']}\n2. Confirm the page renders\n3. Check for blocked or error content",
+                "The page should render successfully and show its own content.",
+                "page_load",
+                page_profile["page_url"],
+            ),
             pending_test(
-                f"Heading Structure on '{title}' ({profile['heading_count']} headings)",
-                f"1. Inspect heading hierarchy on {page_url}\n2. Verify H1 presence\n3. Check logical nesting",
+                f"Heading Structure on {page_title} ({page_profile['heading_count']} headings)",
+                f"1. Inspect heading hierarchy on {page_profile['page_url']}\n2. Verify H1 presence\n3. Check logical nesting",
                 "Page should have a clear H1 and structured headings.",
                 "heading_structure",
+                page_profile["page_url"],
             ),
             pending_test(
-                f"Content Depth on {domain} ({profile['html_length']} bytes)",
-                f"1. Measure rendered HTML size ({profile['html_length']} bytes)\n2. Compare against minimum threshold\n3. Flag thin pages",
+                f"Content Depth on {page_title} ({page_profile['html_length']} bytes)",
+                f"1. Measure rendered HTML size ({page_profile['html_length']} bytes)\n2. Compare against minimum threshold\n3. Flag thin pages",
                 "Page should contain substantive content beyond a loading shell.",
                 "content_depth",
+                page_profile["page_url"],
             ),
-        ],
-    })
+        ]
 
-    if profile["image_count"] > 0:
-        use_cases.append({
-            "title": f"Image Accessibility on {domain}",
-            "description": f"Check alt text on {profile['image_count']} images found on '{title}'.",
-            "test_cases": [
+        if page_profile["link_count"] > 0:
+            sample_text = ", ".join(page_profile["link_texts"][:3]) or "navigation links"
+            page_specific_cases.append(
                 pending_test(
-                    f"Alt Text Coverage ({profile['images_missing_alt']} missing on {domain})",
-                    f"1. Scan {profile['image_count']} images\n2. Count images without alt text\n3. Report offenders",
+                    f"Link Health Check ({page_profile['link_count']} links on {page_title})",
+                    f"1. Sample up to 8 links from {page_title} ({sample_text})\n2. Verify each responds with HTTP < 400\n3. Flag broken links",
+                    "Navigation links on this page should resolve without client or server errors.",
+                    "link_health",
+                    page_profile["page_url"],
+                )
+            )
+        elif not page_profile["is_blocked"]:
+            page_specific_cases.append(
+                pending_test(
+                    f"Missing Navigation on '{page_title}'",
+                    f"1. Scan {page_profile['page_url']}\n2. Search for anchor navigation\n3. Confirm crawlability",
+                    "The page should expose at least one navigational link if it is intended to branch to other screens.",
+                    "navigation_presence",
+                    page_profile["page_url"],
+                )
+            )
+
+        if page_profile["form_count"] > 0:
+            field_count = len(page_profile["form_field_names"])
+            field_label = ", ".join(page_profile["form_field_names"][:4]) or "form fields"
+            page_specific_cases.append(
+                pending_test(
+                    f"Required Field Validation - {page_title} ({field_count} fields)",
+                    f"1. Open {page_title}\n2. Fill with dummy values where applicable\n3. Leave required fields blank and attempt submit\n4. Verify validation messages",
+                    "Required inputs should be marked and enforced before submission, including dummy form entry and validation checks.",
+                    "form_required",
+                    page_profile["page_url"],
+                )
+            )
+            use_cases.append({
+                "title": f"Form Flow on {page_title}",
+                "description": f"Validate forms and dummy user input on '{page_title}' using fields like {field_label}.",
+                "test_cases": [page_specific_cases[-1]],
+            })
+
+        if page_profile["image_count"] > 0:
+            page_specific_cases.append(
+                pending_test(
+                    f"Alt Text Coverage on {page_title} ({page_profile['images_missing_alt']} missing)",
+                    f"1. Scan {page_profile['image_count']} images\n2. Count images without alt text\n3. Report offenders",
                     "Informative images should include descriptive alt attributes.",
                     "image_alt",
+                    page_profile["page_url"],
                 )
-            ],
+            )
+
+        use_cases.append({
+            "title": f"Page Coverage — {page_title}",
+            "description": f"Validate the actual page '{page_title}' at {page_profile['page_url']}.",
+            "test_cases": page_specific_cases,
         })
 
     if profile["meta_count"] < 3:
@@ -769,6 +807,10 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
     os.makedirs(screenshot_dir, exist_ok=True)
     base_url = pages[0].get("page_url") if pages else ""
     profile = aggregate_site_profile(base_url, pages)
+    page_profiles = {
+        normalize_url(page.get("page_url") or base_url): build_page_profile(page, base_url)
+        for page in pages or []
+    }
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
@@ -782,7 +824,8 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
         for use_case_id, test_cases in use_case_mapping.items():
             for test_data in test_cases:
                 page_url = normalize_url(test_data.get("page_url", base_url))
-                actual_status, actual_error, severity = run_test_validation(page, context, test_data, profile)
+                test_profile = page_profiles.get(page_url, profile)
+                actual_status, actual_error, severity = run_test_validation(page, context, test_data, test_profile)
 
                 db = SessionLocal()
                 try:

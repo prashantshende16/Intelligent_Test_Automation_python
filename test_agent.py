@@ -10,7 +10,7 @@ from agent import build_test_plan, read_key_files, scan_codebase
 
 
 class BuildTestPlanTests(unittest.TestCase):
-    def test_build_test_plan_generates_navigation_and_form_cases(self):
+    def test_build_test_plan_generates_page_specific_and_form_cases(self):
         pages = [
             {
                 "page_url": "https://example.com",
@@ -35,7 +35,9 @@ class BuildTestPlanTests(unittest.TestCase):
         self.assertGreaterEqual(len(result["use_cases"]), 2)
         self.assertGreaterEqual(len(result["suggestions"]), 1)
         test_titles = [tc["title"] for use_case in result["use_cases"] for tc in use_case["test_cases"]]
-        self.assertIn("Required Field Validation - 1 Fields", test_titles)
+        self.assertTrue(any("Load Example Site" in title for title in test_titles))
+        self.assertTrue(any("Required Field Validation" in title for title in test_titles))
+        self.assertTrue(any("dummy values" in (tc["steps"] or "").lower() for use_case in result["use_cases"] for tc in use_case["test_cases"]))
 
     def test_build_test_plan_handles_server_error(self):
         pages = [
@@ -56,6 +58,35 @@ class BuildTestPlanTests(unittest.TestCase):
         self.assertIn("example.com", result["use_cases"][0]["title"])
         self.assertEqual(result["use_cases"][0]["test_cases"][0]["status"], "pending")
         self.assertEqual(result["use_cases"][0]["test_cases"][0]["check_type"], "page_load")
+
+    def test_build_test_plan_includes_each_discovered_page(self):
+        pages = [
+            {
+                "page_url": "https://example.com",
+                "title": "Home",
+                "headings": ["h1: Home"],
+                "links": [{"href": "/about", "text": "About"}],
+                "forms": [],
+                "meta_tags": {},
+                "html_snippet": "<html>home</html>",
+                "status_code": 200,
+            },
+            {
+                "page_url": "https://example.com/about",
+                "title": "About Us",
+                "headings": ["h1: About"],
+                "links": [],
+                "forms": [],
+                "meta_tags": {},
+                "html_snippet": "<html>about</html>",
+                "status_code": 200,
+            },
+        ]
+
+        result = build_test_plan("https://example.com", pages, {})
+        page_titles = [uc["title"] for uc in result["use_cases"]]
+        self.assertTrue(any("Home" in title for title in page_titles))
+        self.assertTrue(any("About Us" in title for title in page_titles))
 
     def test_build_test_plan_differs_between_sites(self):
         rich_site = [{
@@ -89,8 +120,8 @@ class BuildTestPlanTests(unittest.TestCase):
         rich_titles = [tc["title"] for uc in rich_plan["use_cases"] for tc in uc["test_cases"]]
         thin_titles = [tc["title"] for uc in thin_plan["use_cases"] for tc in uc["test_cases"]]
         self.assertNotEqual(rich_titles, thin_titles)
-        self.assertTrue(any("shop.example.com" in title for title in rich_titles))
-        self.assertTrue(any("minimal.example.org" in title for title in thin_titles))
+        self.assertTrue(any("Shop Example" in title for title in rich_titles))
+        self.assertTrue(any("Minimal" in title for title in thin_titles))
 
 
 class CodebaseScannerTests(unittest.TestCase):
