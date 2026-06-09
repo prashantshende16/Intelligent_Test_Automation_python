@@ -780,6 +780,36 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
                 return "failed", f"{len(missing)} image(s) without alt text on {domain}: {', '.join(missing[:3])}. These images are missing accessible descriptions.", "medium"
             return "passed", None, None
 
+        if check_type == "manual_page_load":
+            response = page.goto(page_url, wait_until="domcontentloaded")
+            status = response.status if response else 500
+            body_text = (page.locator("body").inner_text(timeout=5000) or "").strip()
+            if status != 200:
+                return "failed", f"Manual page load failed on {domain} with HTTP {status}. Visible body preview: {body_text[:240] or 'empty body'}", "critical"
+            if len(body_text) < 40:
+                return "failed", f"Manual page load on {domain} produced very little visible content. Body preview: {body_text[:240] or 'empty body'}", "high"
+            return "passed", None, None
+
+        if check_type == "manual_blocker_check":
+            response = page.goto(page_url, wait_until="domcontentloaded")
+            status = response.status if response else 500
+            body_text = (page.locator("body").inner_text(timeout=5000) or "").strip()
+            console_messages = []
+            try:
+                console_messages = page.evaluate("() => window.__qa_console_messages || []")
+            except Exception:
+                console_messages = []
+            if status >= 400:
+                return "failed", f"Manual blocker check on {domain} found HTTP {status}. Visible body preview: {body_text[:240] or 'empty body'}", "critical"
+            blocker_hits = [marker for marker in BLOCKED_PAGE_MARKERS if marker in body_text.lower()]
+            if blocker_hits:
+                return "failed", f"Manual blocker check on {domain} found blocking text: {', '.join(blocker_hits)}.", "high"
+            if len(body_text) < 40:
+                return "failed", f"Manual blocker check on {domain} found almost no visible content. Body preview: {body_text[:240] or 'empty body'}", "high"
+            if console_messages:
+                return "failed", f"Manual blocker check on {domain} detected console messages: {', '.join(map(str, console_messages[:5]))}", "medium"
+            return "passed", None, None
+
         # Legacy/Gemini tests without check_type — validate keywords against live page
         title_lower = test_data.get("title", "").lower()
         if "required field" in title_lower:
@@ -800,6 +830,49 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
 
     except Exception as exc:
         return "failed", f"Runtime validation failure on {domain}: {exc}", "medium"
+
+
+def build_manual_diagnostic_plan(url: str) -> dict:
+    """Fallback diagnostic plan for hard-to-inspect sites like aahoa.com."""
+    normalized = normalize_url(url)
+    domain = normalized.split("//", 1)[1].split("/")[0]
+    return {
+        "use_cases": [
+            {
+                "title": f"Manual Diagnostic — {domain}",
+                "description": "Direct browser verification with explicit failure capture for the submitted site.",
+                "test_cases": [
+                    {
+                        "title": f"Open {domain} homepage",
+                        "steps": f"1. Navigate to {normalized}\n2. Wait for DOM content\n3. Capture visible page text and browser state",
+                        "expected_result": "The homepage should load and expose usable content.",
+                        "status": "pending",
+                        "error_message": None,
+                        "severity": None,
+                        "page_url": normalized,
+                        "check_type": "manual_page_load",
+                    },
+                    {
+                        "title": f"Inspect blocking indicators on {domain}",
+                        "steps": f"1. Open {normalized}\n2. Check for bot-protection text, redirect loops, console errors, and failed requests\n3. Capture the root cause if the page fails",
+                        "expected_result": "The page should not be blocked and should not throw browser-level errors.",
+                        "status": "pending",
+                        "error_message": None,
+                        "severity": None,
+                        "page_url": normalized,
+                        "check_type": "manual_blocker_check",
+                    },
+                ],
+            }
+        ],
+        "suggestions": [
+            {
+                "title": f"Improve diagnostic capture for {domain}",
+                "description": "This site needs deeper browser capture because the current automation path may be missing the true runtime failure.",
+                "priority": "high",
+            }
+        ],
+    }
 
 
 def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_case_titles: dict) -> list:
@@ -1235,7 +1308,18 @@ Return ONLY raw JSON. No markdown code blocks.
             raise Exception(f"Gemini API Error: {response.text}")
 
         result_json = response.json()
-        text_content = result_json["candidates"][0]["content"]["parts"][0]["text"].strip()
+        candidates = result_json.get("candidates", [])
+        if not candidates:
+            raise ValueError(f"Gemini returned no candidates: {result_json}")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        if not parts:
+            raise ValueError(f"Gemini returned no content parts: {result_json}")
+
+        text_content = parts[0].get("text", "").strip()
+        if not text_content:
+            raise ValueError(f"Gemini returned empty text content: {result_json}")
+
         if text_content.startswith("```"):
             lines = text_content.splitlines()
             if lines[0].startswith("```"):
@@ -1244,9 +1328,15 @@ Return ONLY raw JSON. No markdown code blocks.
                 lines = lines[:-1]
             text_content = "\n".join(lines).strip()
 
-        return json.loads(text_content)
+        parsed = json.loads(text_content)
+        if not isinstance(parsed, dict):
+            raise ValueError("Gemini response was not a JSON object.")
+        parsed.setdefault("use_cases", [])
+        parsed.setdefault("suggestions", [])
+        return parsed
     except Exception as exc:
         logger.error(f"Failed to generate analysis using Gemini: {exc}. Falling back to built-in generator.")
+        logger.error(traceback.format_exc())
         return {"use_cases": [], "suggestions": []}
 
 
@@ -1525,6 +1615,14 @@ def run_testing_agent(task_id: str):
     db: Session = SessionLocal()
 
     try:
+        def write_orchestrator_log(message: str):
+            if not orchestrator_state:
+                return
+            current = orchestrator_state.log_output or ""
+            orchestrator_state.log_output = current + message.rstrip() + "\n"
+            orchestrator_state.completed_at = None
+            db.commit()
+
         task = db.query(Task).filter(Task.id == task_id).first()
         if not task:
             logger.error(f"Task {task_id} not found in database.")
@@ -1539,6 +1637,8 @@ def run_testing_agent(task_id: str):
             orchestrator_state.started_at = datetime.utcnow()
             orchestrator_state.log_output = "[Orchestrator] Started pipeline.\n"
             db.commit()
+            write_orchestrator_log(f"[Orchestrator] Task URL: {task.url}")
+            write_orchestrator_log("[Orchestrator] Stage: crawling")
 
         codebase = db.query(Codebase).filter(Codebase.task_id == task_id).first()
         codebase_data = {
@@ -1556,19 +1656,16 @@ def run_testing_agent(task_id: str):
             codebase.file_tree = json.dumps(codebase_data["file_tree"])
             codebase.analyzed_at = datetime.utcnow()
             key_files_context = read_key_files(codebase.local_path, codebase_data)
-            if orchestrator_state:
-                orchestrator_state.log_output += f"[Orchestrator] Scanned codebase: {codebase.local_path}\n"
-                orchestrator_state.log_output += f"[Orchestrator] Detected framework: {codebase.framework_type}\n"
-                orchestrator_state.log_output += f"[Orchestrator] Discovered {len(codebase_data['file_list'])} files.\n"
-                db.commit()
+            write_orchestrator_log(f"[Orchestrator] Scanned codebase: {codebase.local_path}")
+            write_orchestrator_log(f"[Orchestrator] Detected framework: {codebase.framework_type}")
+            write_orchestrator_log(f"[Orchestrator] Discovered {len(codebase_data['file_list'])} files.")
 
         page_snapshots = discover_pages_with_playwright(task.url)
-        if orchestrator_state:
-            orchestrator_state.log_output += f"[Orchestrator] Discovered {len(page_snapshots)} page snapshots.\n"
-            db.commit()
+        write_orchestrator_log(f"[Orchestrator] Discovered {len(page_snapshots)} page snapshots.")
 
         task.status = "generating_test_cases"
         db.commit()
+        write_orchestrator_log("[Orchestrator] Stage: generating_test_cases")
         time.sleep(1.5)
 
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -1587,13 +1684,21 @@ def run_testing_agent(task_id: str):
                 "status_code": site_profile.get("status_code", 200),
             }
             analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, api_key)
-            if orchestrator_state:
-                source = "Gemini API" if analysis.get("use_cases") else "local fallback"
-                orchestrator_state.log_output += f"[Orchestrator] Test planning source: {source}.\n"
-                db.commit()
+            source = "Gemini API" if analysis.get("use_cases") else "local fallback"
+            write_orchestrator_log(f"[Orchestrator] Test planning source: {source}")
 
         if not analysis.get("use_cases"):
             analysis = build_test_plan(task.url, page_snapshots, codebase_data)
+            write_orchestrator_log("[Orchestrator] Local fallback planner produced the test suite.")
+
+        normalized_task_url = normalize_url(task.url)
+        if "aahoa.com" in normalized_task_url:
+            analysis = build_manual_diagnostic_plan(task.url)
+            write_orchestrator_log("[Orchestrator] Using manual diagnostic fallback for aahoa.com.")
+
+        write_orchestrator_log(
+            f"[Orchestrator] Planned {len(analysis.get('use_cases', []))} use case(s) and {len(analysis.get('suggestions', []))} suggestion(s)."
+        )
 
         use_cases_mapping = {}
         use_case_titles = {}
@@ -1603,6 +1708,7 @@ def run_testing_agent(task_id: str):
             db.flush()
             use_cases_mapping[use_case.id] = uc_data.get("test_cases", [])
             use_case_titles[use_case.id] = uc_data.get("title")
+        write_orchestrator_log(f"[Orchestrator] Persisted {len(use_cases_mapping)} use case record(s).")
 
         for sug_data in analysis.get("suggestions", []):
             suggestion = Suggestion(
@@ -1614,12 +1720,12 @@ def run_testing_agent(task_id: str):
             db.add(suggestion)
 
         db.commit()
+        write_orchestrator_log(f"[Orchestrator] Persisted {len(analysis.get('suggestions', []))} suggestion record(s).")
 
         task.status = "running_tests"
         db.commit()
-        if orchestrator_state:
-            orchestrator_state.log_output += "[Orchestrator] Executing browser-driven test validations.\n"
-            db.commit()
+        write_orchestrator_log("[Orchestrator] Stage: running_tests")
+        write_orchestrator_log("[Orchestrator] Executing browser-driven test validations.")
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             executor.submit(run_ui_ux_agent, task.id, task.url, page_snapshots, codebase_data)
@@ -1630,9 +1736,11 @@ def run_testing_agent(task_id: str):
 
         time.sleep(2.5)
         error_ids = execute_test_plan(task.id, page_snapshots, use_cases_mapping, use_case_titles)
+        write_orchestrator_log(f"[Orchestrator] Browser validations completed with {len(error_ids)} error(s).")
 
         if codebase and error_ids:
             run_code_review_agent(task.id, codebase.local_path, codebase_data, error_ids)
+            write_orchestrator_log("[Orchestrator] Code review mapping completed.")
         else:
             code_review_state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "CodeReview").first()
             if code_review_state:
@@ -1640,12 +1748,13 @@ def run_testing_agent(task_id: str):
                 code_review_state.log_output = "[CodeReview Agent] No codebase details or errors to map.\n"
                 code_review_state.completed_at = datetime.utcnow()
                 db.commit()
+            write_orchestrator_log("[Orchestrator] No code review mapping required.")
 
         task.status = "completed"
         task.completed_at = datetime.utcnow()
         if orchestrator_state:
             orchestrator_state.status = "completed"
-            orchestrator_state.log_output += "[Orchestrator] Pipeline complete.\n"
+            orchestrator_state.log_output = (orchestrator_state.log_output or "") + "[Orchestrator] Pipeline complete.\n"
             orchestrator_state.completed_at = datetime.utcnow()
         db.commit()
         logger.info(f"AI Agent background task completed for task ID: {task_id}")
@@ -1661,6 +1770,7 @@ def run_testing_agent(task_id: str):
         if orchestrator_state:
             orchestrator_state.status = "failed"
             orchestrator_state.log_output = (orchestrator_state.log_output or "") + f"[Orchestrator Error] {exc}\n"
+            orchestrator_state.log_output += traceback.format_exc()
             orchestrator_state.completed_at = datetime.utcnow()
         db.commit()
     finally:
