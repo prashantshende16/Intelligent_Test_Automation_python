@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import SessionLocal
-from models import Task, UseCase, TestCase, TestError, Suggestion, Codebase, AgentState, CodeReference
+from models import Task, UseCase, TestCase, TestError, Suggestion, Codebase, AgentState, CodeReference, TaskAuth
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -30,7 +30,32 @@ def same_origin(candidate: str, base_url: str) -> bool:
     try:
         candidate = normalize_url(candidate)
         base_url = normalize_url(base_url)
-        return candidate.split("//", 1)[1].split("/")[0] == base_url.split("//", 1)[1].split("/")[0]
+        candidate_host = candidate.split("//", 1)[1].split("/")[0].split(":")[0].lower()
+        base_host = base_url.split("//", 1)[1].split("/")[0].split(":")[0].lower()
+        if candidate_host == base_host:
+            return True
+        return candidate_host.endswith("." + base_host) or base_host.endswith("." + candidate_host)
+    except Exception:
+        return False
+
+
+def same_site(candidate: str, base_url: str) -> bool:
+    """Allow crawling across sibling subdomains that belong to the same registrable site."""
+    if not candidate or not base_url:
+        return False
+    try:
+        candidate = normalize_url(candidate)
+        base_url = normalize_url(base_url)
+        candidate_host = candidate.split("//", 1)[1].split("/")[0].split(":")[0].lower()
+        base_host = base_url.split("//", 1)[1].split("/")[0].split(":")[0].lower()
+
+        def root_domain(host: str) -> str:
+            parts = host.split(".")
+            if len(parts) <= 2:
+                return host
+            return ".".join(parts[-2:])
+
+        return root_domain(candidate_host) == root_domain(base_host)
     except Exception:
         return False
 
@@ -378,17 +403,23 @@ def extract_page_snapshot(page, current_url: str, status_code: int = 200) -> dic
     }
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 4) -> list:
+def discover_pages_with_playwright(url: str, max_pages: int = 12, auth: dict = None, seed_urls: list = None) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
     queue = [normalized]
+    for seed in seed_urls or []:
+        normalized_seed = normalize_url(seed)
+        if normalized_seed not in queue:
+            queue.append(normalized_seed)
 
     try:
         logger.info(f"Starting Playwright crawl for {normalized}")
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
+            if auth and auth.get("auth_required"):
+                authenticate_browser_context(context, auth, normalized, logger.info)
             page = context.new_page()
             page.set_default_timeout(20000)
 
@@ -424,7 +455,7 @@ def discover_pages_with_playwright(url: str, max_pages: int = 4) -> list:
                     link_hrefs = []
 
                 for href in link_hrefs:
-                    if href and same_origin(href, normalized) and href not in visited and href not in queue:
+                    if href and same_site(href, normalized) and href not in visited and href not in queue:
                         if len(queue) + len(snapshots) < max_pages:
                             queue.append(href)
 
@@ -699,6 +730,106 @@ def save_screenshot(page, path: str) -> None:
         logger.warning(f"Screenshot save failed: {exc}")
 
 
+def authenticate_browser_context(context, auth: dict, start_url: str, log_callback=None) -> bool:
+    """Attempt a lightweight login flow when credentials are provided."""
+    if not auth or not auth.get("auth_required"):
+        return False
+
+    login_url = normalize_url(auth.get("auth_login_url") or start_url)
+    username = auth.get("auth_username") or ""
+    password = auth.get("auth_password") or ""
+    otp_code = auth.get("auth_otp_code") or ""
+
+    page = context.new_page()
+    page.set_default_timeout(20000)
+    try:
+        if log_callback:
+            log_callback(f"[Orchestrator] Attempting authenticated session via {login_url}")
+        page.goto(login_url, wait_until="domcontentloaded")
+
+        def fill_first(selectors, value):
+            for selector in selectors:
+                loc = page.locator(selector)
+                if loc.count() > 0:
+                    try:
+                        loc.first.fill(value)
+                        return True
+                    except Exception:
+                        continue
+            return False
+
+        if username:
+            fill_first([
+                "input[type='email']",
+                "input[name*='user' i]",
+                "input[name*='email' i]",
+                "input[name*='login' i]",
+                "input[placeholder*='email' i]",
+                "input[placeholder*='user' i]",
+                "input[type='text']",
+            ], username)
+        if password:
+            fill_first([
+                "input[type='password']",
+                "input[name*='pass' i]",
+                "input[placeholder*='password' i]",
+            ], password)
+        if otp_code:
+            fill_first([
+                "input[name*='otp' i]",
+                "input[name*='code' i]",
+                "input[name*='token' i]",
+                "input[placeholder*='otp' i]",
+                "input[placeholder*='code' i]",
+            ], otp_code)
+
+        submit_selectors = [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Login')",
+            "button:has-text('Sign in')",
+            "button:has-text('Submit')",
+            "text=Login",
+            "text=Sign in",
+        ]
+        submitted = False
+        for selector in submit_selectors:
+            try:
+                loc = page.locator(selector)
+                if loc.count() > 0:
+                    loc.first.click()
+                    submitted = True
+                    break
+            except Exception:
+                continue
+
+        if submitted:
+            try:
+                page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+        success_markers = ["logout", "sign out", "my account", "dashboard", "profile", "member area"]
+        body_text = (page.locator("body").inner_text(timeout=5000) or "").lower()
+        if any(marker in body_text for marker in success_markers):
+            if log_callback:
+                log_callback(f"[Orchestrator] Authenticated session appears active at {login_url}")
+            return True
+
+        if log_callback:
+            log_callback(f"[Orchestrator] Authentication attempt completed, but success markers were not detected at {login_url}")
+        return submitted
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[Orchestrator] Authentication attempt failed: {exc}")
+        return False
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
 def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
     """Execute a live browser check and return (status, error_message, severity)."""
     check_type = test_data.get("check_type", "")
@@ -880,7 +1011,7 @@ def build_manual_diagnostic_plan(url: str) -> dict:
     }
 
 
-def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_case_titles: dict) -> list:
+def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_case_titles: dict, auth: dict = None, log_callback=None) -> list:
     error_ids = []
     screenshot_dir = os.path.join("screenshots", task_id)
     os.makedirs(screenshot_dir, exist_ok=True)
@@ -897,6 +1028,8 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
             ignore_https_errors=True,
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         )
+        if auth and auth.get("auth_required"):
+            authenticate_browser_context(context, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info)
         page = context.new_page()
         page.set_default_timeout(20000)
 
@@ -904,7 +1037,12 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
             for test_data in test_cases:
                 page_url = normalize_url(test_data.get("page_url", base_url))
                 test_profile = page_profiles.get(page_url, profile)
+                if log_callback:
+                    log_callback(f"[Orchestrator] Testing page: {page_url} :: {test_data.get('title', 'Anonymous Test')}")
                 actual_status, actual_error, severity = run_test_validation(page, context, test_data, test_profile)
+                if log_callback:
+                    outcome = "passed" if actual_status == "passed" else "failed"
+                    log_callback(f"[Orchestrator] Result: {outcome} for {page_url}")
 
                 db = SessionLocal()
                 try:
@@ -1646,6 +1784,10 @@ def run_testing_agent(task_id: str):
             write_orchestrator_log("[Orchestrator] Stage: crawling")
 
         codebase = db.query(Codebase).filter(Codebase.task_id == task_id).first()
+        auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+        seed_urls = []
+        if getattr(task, "url", ""):
+            seed_urls.append(task.url)
         codebase_data = {
             "framework_type": "HTML/JS",
             "file_list": [],
@@ -1665,7 +1807,40 @@ def run_testing_agent(task_id: str):
             write_orchestrator_log(f"[Orchestrator] Detected framework: {codebase.framework_type}")
             write_orchestrator_log(f"[Orchestrator] Discovered {len(codebase_data['file_list'])} files.")
 
-        page_snapshots = discover_pages_with_playwright(task.url)
+        auth_data = None
+        if auth:
+            auth_data = {
+                "auth_required": bool(auth.auth_required),
+                "auth_login_url": auth.auth_login_url,
+                "auth_username": auth.auth_username,
+                "auth_password": auth.auth_password,
+                "auth_otp_code": auth.auth_otp_code,
+                "auth_otp_hint": auth.auth_otp_hint,
+            }
+
+        if task.url:
+            normalized_task_url = normalize_url(task.url)
+            if "aahoa.com" in normalized_task_url:
+                seed_urls.extend([
+                    "https://www.aahoa.com/strategicpartners",
+                    "https://ams.aahoa.com/login",
+                    "https://ams.aahoa.com/become-a-member",
+                    "https://ams.aahoa.com/become-a-vendor",
+                    "https://www.aahoa.com/membership/vendors/vendor-benefits",
+                ])
+
+        deduped_seed_urls = []
+        for seed in seed_urls:
+            normalized_seed = normalize_url(seed)
+            if normalized_seed not in deduped_seed_urls:
+                deduped_seed_urls.append(normalized_seed)
+        seed_urls = deduped_seed_urls
+        if seed_urls:
+            write_orchestrator_log(f"[Orchestrator] Seeded pages: {', '.join(seed_urls)}")
+
+        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls)
+        discovered_urls = [snap.get("page_url", "") for snap in page_snapshots if snap.get("page_url")]
+        write_orchestrator_log(f"[Orchestrator] Discovered pages: {', '.join(discovered_urls) if discovered_urls else 'none'}")
         write_orchestrator_log(f"[Orchestrator] Discovered {len(page_snapshots)} page snapshots.")
 
         task.status = "generating_test_cases"
@@ -1695,11 +1870,6 @@ def run_testing_agent(task_id: str):
         if not analysis.get("use_cases"):
             analysis = build_test_plan(task.url, page_snapshots, codebase_data)
             write_orchestrator_log("[Orchestrator] Local fallback planner produced the test suite.")
-
-        normalized_task_url = normalize_url(task.url)
-        if "aahoa.com" in normalized_task_url:
-            analysis = build_manual_diagnostic_plan(task.url)
-            write_orchestrator_log("[Orchestrator] Using manual diagnostic fallback for aahoa.com.")
 
         write_orchestrator_log(
             f"[Orchestrator] Planned {len(analysis.get('use_cases', []))} use case(s) and {len(analysis.get('suggestions', []))} suggestion(s)."
@@ -1740,7 +1910,7 @@ def run_testing_agent(task_id: str):
             executor.submit(run_image_agent, task.id, task.url, page_snapshots, codebase_data)
 
         time.sleep(2.5)
-        error_ids = execute_test_plan(task.id, page_snapshots, use_cases_mapping, use_case_titles)
+        error_ids = execute_test_plan(task.id, page_snapshots, use_cases_mapping, use_case_titles, auth=auth_data, log_callback=write_orchestrator_log)
         write_orchestrator_log(f"[Orchestrator] Browser validations completed with {len(error_ids)} error(s).")
 
         if codebase and error_ids:

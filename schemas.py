@@ -7,6 +7,13 @@ class TaskBase(BaseModel):
 
 class TaskCreate(TaskBase):
     codebase_path: Optional[str] = None
+    seed_urls: Optional[List[str]] = None
+    auth_required: Optional[bool] = False
+    auth_login_url: Optional[str] = None
+    auth_username: Optional[str] = None
+    auth_password: Optional[str] = None
+    auth_otp_code: Optional[str] = None
+    auth_otp_hint: Optional[str] = None
 
 class TaskResponse(BaseModel):
     id: str
@@ -56,6 +63,29 @@ class CodebaseResponse(BaseModel):
     framework_type: str
     file_tree: Optional[str] = None
     analyzed_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class TaskAuthResponse(BaseModel):
+    id: str
+    task_id: str
+    auth_required: bool
+    auth_login_url: Optional[str] = None
+    auth_username: Optional[str] = None
+    auth_password: Optional[str] = None
+    auth_otp_code: Optional[str] = None
+    auth_otp_hint: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+class TaskSeedResponse(BaseModel):
+    id: str
+    task_id: str
+    seed_urls_json: Optional[str] = None
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -117,6 +147,8 @@ class TaskDetailsResponse(BaseModel):
     errors: List[TestErrorResponse]
     suggestions: List[SuggestionResponse]
     codebase: Optional[CodebaseResponse] = None
+    auth: Optional[TaskAuthResponse] = None
+    seeds: Optional[TaskSeedResponse] = None
     agent_states: List[AgentStateResponse] = []
 
 class DashboardStats(BaseModel):

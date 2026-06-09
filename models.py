@@ -21,6 +21,8 @@ class Task(Base):
     errors = relationship("TestError", back_populates="task", cascade="all, delete-orphan")
     suggestions = relationship("Suggestion", back_populates="task", cascade="all, delete-orphan")
     codebase = relationship("Codebase", back_populates="task", uselist=False, cascade="all, delete-orphan")
+    auth = relationship("TaskAuth", back_populates="task", uselist=False, cascade="all, delete-orphan")
+    seeds = relationship("TaskSeed", back_populates="task", uselist=False, cascade="all, delete-orphan")
     agent_states = relationship("AgentState", back_populates="task", cascade="all, delete-orphan")
 
 
@@ -97,6 +99,33 @@ class Codebase(Base):
     analyzed_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("Task", back_populates="codebase")
+
+
+class TaskAuth(Base):
+    __tablename__ = "task_auths"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    task_id = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, unique=True)
+    auth_required = Column(Integer, default=0)
+    auth_login_url = Column(String, nullable=True)
+    auth_username = Column(String, nullable=True)
+    auth_password = Column(String, nullable=True)
+    auth_otp_code = Column(String, nullable=True)
+    auth_otp_hint = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    task = relationship("Task", back_populates="auth")
+
+
+class TaskSeed(Base):
+    __tablename__ = "task_seeds"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    task_id = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, unique=True)
+    seed_urls_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    task = relationship("Task", back_populates="seeds")
 
 
 class AgentState(Base):

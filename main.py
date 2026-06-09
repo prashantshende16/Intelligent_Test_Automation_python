@@ -1,5 +1,6 @@
 import threading
 import os
+import json
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -71,6 +72,28 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
             framework_type="React"
         )
         db.add(db_codebase)
+
+    if getattr(task_in, "auth_required", False):
+        db_auth = models.TaskAuth(
+            task_id=db_task.id,
+            auth_required=1,
+            auth_login_url=task_in.auth_login_url,
+            auth_username=task_in.auth_username,
+            auth_password=task_in.auth_password,
+            auth_otp_code=task_in.auth_otp_code,
+            auth_otp_hint=task_in.auth_otp_hint,
+        )
+        db.add(db_auth)
+
+    seed_urls = []
+    if getattr(task_in, "seed_urls", None):
+        seed_urls = [seed.strip() for seed in task_in.seed_urls if seed and seed.strip()]
+    if seed_urls:
+        db_seed = models.TaskSeed(
+            task_id=db_task.id,
+            seed_urls_json=json.dumps(seed_urls)
+        )
+        db.add(db_seed)
         
     # Pre-populate Agent states for UI tracking
     for agent_name in ["Orchestrator", "UI_UX", "Responsive", "Form", "API", "Image", "CodeReview"]:
@@ -119,6 +142,8 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
     suggestions = db.query(models.Suggestion).filter(models.Suggestion.task_id == task_id).order_by(models.Suggestion.created_at.asc()).all()
     
     codebase = db.query(models.Codebase).filter(models.Codebase.task_id == task_id).first()
+    auth = db.query(models.TaskAuth).filter(models.TaskAuth.task_id == task_id).first()
+    seeds = db.query(models.TaskSeed).filter(models.TaskSeed.task_id == task_id).first()
     agent_states = db.query(models.AgentState).filter(models.AgentState.task_id == task_id).order_by(models.AgentState.started_at.asc()).all()
     
     return schemas.TaskDetailsResponse(
@@ -128,6 +153,8 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
         errors=errors,
         suggestions=suggestions,
         codebase=codebase,
+        auth=auth,
+        seeds=seeds,
         agent_states=agent_states
     )
 
