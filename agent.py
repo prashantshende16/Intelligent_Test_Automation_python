@@ -2,6 +2,7 @@ import os
 import time
 import json
 import logging
+import traceback
 from urllib.parse import urljoin
 import httpx
 from bs4 import BeautifulSoup
@@ -705,9 +706,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
             response = page.goto(page_url, wait_until="domcontentloaded")
             status = response.status if response else 500
             if status != 200:
-                return "failed", f"Page '{title}' on {domain} returned HTTP {status}.", "critical"
+                return "failed", f"Page '{title}' on {domain} returned HTTP {status}. The server did not load the page successfully.", "critical"
             if profile["is_blocked"]:
-                return "failed", f"Page '{title}' on {domain} appears blocked by bot protection.", "high"
+                return "failed", f"Page '{title}' on {domain} appears blocked by bot protection. The page content could not be fully inspected.", "high"
             return "passed", None, None
 
         page.goto(page_url, wait_until="domcontentloaded")
@@ -730,44 +731,44 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
                 if checked >= 8:
                     break
             if not checked:
-                return "failed", f"No testable links found on {domain}.", "medium"
+                return "failed", f"No testable links found on {domain}. The page may be missing crawlable anchors or navigation links.", "medium"
             if broken:
-                return "failed", f"Broken links on {domain}: {', '.join(broken[:5])}", "high"
+                return "failed", f"Broken links on {domain}: {', '.join(broken[:5])}. These targets returned errors or were unreachable during validation.", "high"
             return "passed", None, None
 
         if check_type == "navigation_presence":
             link_count = page.locator("a[href]").count()
             if link_count == 0:
-                return "failed", f"No navigation links found on '{title}' ({domain}).", "high"
+                return "failed", f"No navigation links found on '{title}' ({domain}). The page does not expose clickable routes for users or crawlers.", "high"
             return "passed", None, None
 
         if check_type == "internal_pages":
             if profile["page_count"] <= 1:
-                return "failed", f"Only 1 page discovered on {domain}. Improve internal linking.", "medium"
+                return "failed", f"Only 1 page discovered on {domain}. Internal routes were not discoverable from the crawl start page.", "medium"
             return "passed", None, None
 
         if check_type == "form_required":
             if page.locator("form").count() == 0:
-                return "failed", f"No forms found on {domain} during live validation.", "medium"
+                return "failed", f"No forms found on {domain} during live validation. The page was expected to contain a form but none was rendered.", "medium"
             optional_inputs = page.eval_on_selector_all(
                 "form input:not([type=hidden]):not([type=submit]):not([type=button]), form textarea, form select",
                 "els => els.filter(el => !el.required && el.type !== 'hidden').map(el => el.name || el.placeholder || el.type)"
             )
             if optional_inputs:
-                return "failed", f"Form fields without required attribute on {domain}: {', '.join(optional_inputs[:5])}", "high"
+                return "failed", f"Form fields without required attribute on {domain}: {', '.join(optional_inputs[:5])}. These inputs can accept invalid empty submissions.", "high"
             return "passed", None, None
 
         if check_type == "heading_structure":
             if page.locator("h1").count() == 0:
-                return "failed", f"No H1 heading on '{title}' ({domain}).", "high"
+                return "failed", f"No H1 heading on '{title}' ({domain}). The page lacks a primary title for SEO and accessibility.", "high"
             return "passed", None, None
 
         if check_type == "content_depth":
             html_length = len(page.content())
             if profile["is_blocked"]:
-                return "failed", f"Page content on {domain} looks like a bot challenge, not real content.", "high"
+                return "failed", f"Page content on {domain} looks like a bot challenge, not real content. Automated inspection could not reach the actual page.", "high"
             if html_length < 3000:
-                return "failed", f"Thin page content ({html_length} bytes) on {domain}.", "low"
+                return "failed", f"Thin page content ({html_length} bytes) on {domain}. The page may be too small, empty, or still loading content.", "low"
             return "passed", None, None
 
         if check_type == "image_alt":
@@ -776,7 +777,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
                 "imgs => imgs.filter(i => !(i.alt || '').trim()).map(i => (i.src || '').split('/').pop().slice(0, 40))"
             )
             if missing:
-                return "failed", f"{len(missing)} image(s) without alt text on {domain}: {', '.join(missing[:3])}", "medium"
+                return "failed", f"{len(missing)} image(s) without alt text on {domain}: {', '.join(missing[:3])}. These images are missing accessible descriptions.", "medium"
             return "passed", None, None
 
         # Legacy/Gemini tests without check_type — validate keywords against live page
@@ -1575,15 +1576,15 @@ def run_testing_agent(task_id: str):
         if api_key:
             site_profile = aggregate_site_profile(task.url, page_snapshots)
             crawl_data_for_ai = {
-                "title": site_profile["primary_title"],
-                "domain": site_profile["domain"],
-                "headings": site_profile["headings"],
-                "forms": site_profile["forms"],
-                "links": site_profile["links"][:20],
-                "meta_tags": site_profile["meta_tags"],
-                "html_length": site_profile["html_length"],
-                "page_count": site_profile["page_count"],
-                "status_code": site_profile["status_code"],
+                "title": site_profile.get("primary_title", "Unknown Page"),
+                "domain": site_profile.get("domain", normalize_url(task.url).split("//", 1)[1].split("/")[0]),
+                "headings": site_profile.get("headings", []),
+                "forms": site_profile.get("forms", []),
+                "links": (site_profile.get("links", []) or [])[:20],
+                "meta_tags": site_profile.get("meta_tags", {}),
+                "html_length": site_profile.get("html_length", 0),
+                "page_count": site_profile.get("page_count", len(page_snapshots)),
+                "status_code": site_profile.get("status_code", 200),
             }
             analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, api_key)
             if orchestrator_state:
@@ -1651,6 +1652,7 @@ def run_testing_agent(task_id: str):
 
     except Exception as exc:
         logger.error(f"Error executing AI testing agent: {exc}")
+        logger.error(traceback.format_exc())
         task = db.query(Task).filter(Task.id == task_id).first()
         if task:
             task.status = "failed"
