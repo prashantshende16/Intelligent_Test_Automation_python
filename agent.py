@@ -163,10 +163,14 @@ def build_page_profile(page: dict, base_url: str) -> dict:
     images = page.get("images", []) or []
     html_snippet = page.get("html_snippet", "") or ""
     status_code = page.get("status_code", 200)
+    domain = page_url.split("//", 1)[1].split("/")[0] if "//" in page_url else page_url
 
     return {
         "page_url": page_url,
+        "url": page_url,
+        "domain": domain,
         "title": title,
+        "primary_title": title,
         "links": links,
         "link_count": len(links),
         "link_texts": [link.get("text", "").strip() for link in links if link.get("text", "").strip()],
@@ -185,6 +189,7 @@ def build_page_profile(page: dict, base_url: str) -> dict:
         "html_length": page.get("html_length", len(html_snippet)),
         "html_snippet": html_snippet,
         "status_code": status_code,
+        "page_count": 1,
         "image_count": len(images),
         "images_missing_alt": sum(1 for image in images if not image.get("has_alt")),
         "is_blocked": any(marker in title.lower() or marker in html_snippet.lower() for marker in BLOCKED_PAGE_MARKERS),
