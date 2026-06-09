@@ -1,9 +1,11 @@
 import threading
 import os
 import json
+import csv
+import io
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List
@@ -157,6 +159,93 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
         seeds=seeds,
         agent_states=agent_states
     )
+
+@app.get("/api/tasks/{task_id}/report.csv")
+def download_task_report(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    use_cases = db.query(models.UseCase).filter(models.UseCase.task_id == task_id).all()
+    test_cases = db.query(models.TestCase).filter(models.TestCase.task_id == task_id).all()
+    errors = db.query(models.TestError).filter(models.TestError.task_id == task_id).all()
+    suggestions = db.query(models.Suggestion).filter(models.Suggestion.task_id == task_id).all()
+    codebase = db.query(models.Codebase).filter(models.Codebase.task_id == task_id).first()
+    auth = db.query(models.TaskAuth).filter(models.TaskAuth.task_id == task_id).first()
+    seeds = db.query(models.TaskSeed).filter(models.TaskSeed.task_id == task_id).first()
+    agent_states = db.query(models.AgentState).filter(models.AgentState.task_id == task_id).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    writer.writerow(["Section", "Field 1", "Field 2", "Field 3", "Field 4", "Field 5", "Field 6", "Field 7", "Field 8"])
+    writer.writerow(["Task", task.id, task.url, task.status, task.created_at.isoformat(), task.completed_at.isoformat() if task.completed_at else "", "", "", ""])
+
+    if codebase:
+        writer.writerow(["Codebase", codebase.local_path, codebase.framework_type, codebase.analyzed_at.isoformat() if codebase.analyzed_at else "", "", "", "", "", ""])
+    if auth:
+        writer.writerow(["Auth", str(bool(auth.auth_required)), auth.auth_login_url or "", auth.auth_username or "", auth.auth_otp_hint or "", "", "", "", ""])
+    if seeds and seeds.seed_urls_json:
+        try:
+            for seed in json.loads(seeds.seed_urls_json):
+                writer.writerow(["Seed URL", seed, "", "", "", "", "", "", ""])
+        except Exception:
+            writer.writerow(["Seed URL", seeds.seed_urls_json, "", "", "", "", "", "", ""])
+
+    writer.writerow(["Use Cases", str(len(use_cases)), "", "", "", "", "", "", ""])
+    for uc in use_cases:
+        writer.writerow(["Use Case", uc.title, uc.description or "", uc.created_at.isoformat(), uc.id, "", "", "", ""])
+
+    writer.writerow(["Test Cases", str(len(test_cases)), "", "", "", "", "", "", ""])
+    for tc in test_cases:
+        writer.writerow([
+            "Test Case",
+            tc.title,
+            tc.status,
+            tc.expected_result or "",
+            tc.error_message or "",
+            tc.steps or "",
+            tc.execution_time if tc.execution_time is not None else "",
+            tc.created_at.isoformat(),
+            tc.use_case_id or "",
+        ])
+
+    writer.writerow(["Errors", str(len(errors)), "", "", "", "", "", "", ""])
+    for err in errors:
+        writer.writerow([
+            "Error",
+            err.message,
+            err.severity,
+            err.page_url,
+            err.screenshot_path or "",
+            err.created_at.isoformat(),
+            err.test_case_id or "",
+            "",
+            "",
+        ])
+
+    writer.writerow(["Suggestions", str(len(suggestions)), "", "", "", "", "", "", ""])
+    for sug in suggestions:
+        writer.writerow(["Suggestion", sug.title, sug.priority, sug.description or "", sug.created_at.isoformat(), "", "", "", ""])
+
+    writer.writerow(["Agent States", str(len(agent_states)), "", "", "", "", "", "", ""])
+    for agent in agent_states:
+        writer.writerow([
+            "Agent",
+            agent.agent_name,
+            agent.status,
+            str(agent.errors_found),
+            agent.started_at.isoformat() if agent.started_at else "",
+            agent.completed_at.isoformat() if agent.completed_at else "",
+            "",
+            "",
+            "",
+        ])
+
+    output.seek(0)
+    filename = f"{task.id}_test_report.csv"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
 
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: str, db: Session = Depends(get_db)):
