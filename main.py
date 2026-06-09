@@ -232,24 +232,28 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
 
     section("Use Cases")
     writer.writerow(["Use Case Title", "Page URL", "Description", "Created At", "Use Case ID"])
+    test_case_page_urls = {}
+    for err in errors:
+        if err.test_case_id and err.page_url:
+            test_case_page_urls[err.test_case_id] = err.page_url
     use_case_page_urls = {}
     for tc in test_cases:
-        if tc.use_case_id and tc.id in test_case_page_urls:
-            use_case_page_urls[tc.use_case_id] = test_case_page_urls[tc.id]
+        if not tc.use_case_id:
+            continue
+        page_url = test_case_page_urls.get(tc.id)
+        if page_url:
+            use_case_page_urls.setdefault(tc.use_case_id, page_url)
     for err in errors:
-        if err.test_case_id:
-            tc = next((item for item in test_cases if item.id == err.test_case_id), None)
-            if tc and tc.use_case_id and err.page_url:
-                use_case_page_urls[tc.use_case_id] = err.page_url
+        if not err.test_case_id or not err.page_url:
+            continue
+        tc = next((item for item in test_cases if item.id == err.test_case_id), None)
+        if tc and tc.use_case_id:
+            use_case_page_urls.setdefault(tc.use_case_id, err.page_url)
     for uc in use_cases:
         writer.writerow([uc.title, use_case_page_urls.get(uc.id, ""), uc.description or "", uc.created_at.isoformat(), uc.id])
 
     section("Test Cases")
     writer.writerow(["Title", "Status", "Page URL", "Expected Result", "Error Message", "Steps", "Execution Time", "Created At", "Use Case ID"])
-    test_case_page_urls = {}
-    for err in errors:
-        if err.test_case_id and err.page_url:
-            test_case_page_urls[err.test_case_id] = err.page_url
     for tc in test_cases:
         writer.writerow([
             tc.title,
