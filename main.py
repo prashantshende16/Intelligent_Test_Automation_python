@@ -7,7 +7,7 @@ from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, text, inspect
 from typing import List
 
 from database import engine, Base, get_db
@@ -17,6 +17,17 @@ from agent import run_testing_agent
 
 # Initialize Database tables
 Base.metadata.create_all(bind=engine)
+
+def ensure_task_auth_columns():
+    inspector = inspect(engine)
+    if "task_auths" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("task_auths")}
+    if "auth_post_login_url" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task_auths ADD COLUMN auth_post_login_url VARCHAR"))
+
+ensure_task_auth_columns()
 
 app = FastAPI(title="AI Website Testing Automation API")
 
@@ -47,6 +58,11 @@ def get_task_with_counts(task: models.Task, db: Session) -> schemas.TaskResponse
         error_count=error_count,
         suggestion_count=suggestion_count
     )
+
+def start_task_thread(task_id: str) -> None:
+    thread = threading.Thread(target=run_testing_agent, args=(task_id,))
+    thread.daemon = True
+    thread.start()
 
 @app.post("/api/tasks", response_model=schemas.TaskResponse)
 def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
@@ -80,6 +96,7 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
             task_id=db_task.id,
             auth_required=1,
             auth_login_url=task_in.auth_login_url,
+            auth_post_login_url=task_in.auth_post_login_url,
             auth_username=task_in.auth_username,
             auth_password=task_in.auth_password,
             auth_otp_code=task_in.auth_otp_code,
@@ -110,11 +127,69 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
     db.refresh(db_task)
     
     # Spawn background thread to run AI Testing Agent
-    thread = threading.Thread(target=run_testing_agent, args=(db_task.id,))
-    thread.daemon = True
-    thread.start()
+    start_task_thread(db_task.id)
     
     return get_task_with_counts(db_task, db)
+
+@app.patch("/api/tasks/{task_id}/input", response_model=schemas.TaskResponse)
+def update_task_input(task_id: str, task_input: schemas.TaskInputUpdate, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    auth = db.query(models.TaskAuth).filter(models.TaskAuth.task_id == task_id).first()
+    if task_input.auth_required is not None:
+        if not auth:
+            auth = models.TaskAuth(task_id=task_id, auth_required=int(bool(task_input.auth_required)))
+            db.add(auth)
+        auth.auth_required = int(bool(task_input.auth_required))
+    if auth:
+        if task_input.auth_login_url is not None:
+            auth.auth_login_url = task_input.auth_login_url
+        if task_input.auth_post_login_url is not None:
+            auth.auth_post_login_url = task_input.auth_post_login_url
+        if task_input.auth_username is not None:
+            auth.auth_username = task_input.auth_username
+        if task_input.auth_password is not None:
+            auth.auth_password = task_input.auth_password
+        if task_input.auth_otp_code is not None:
+            auth.auth_otp_code = task_input.auth_otp_code
+        if task_input.auth_otp_hint is not None:
+            auth.auth_otp_hint = task_input.auth_otp_hint
+
+    if task_input.form_values_json is not None:
+        form_data = db.query(models.TaskFormData).filter(models.TaskFormData.task_id == task_id).first()
+        if not form_data:
+            form_data = models.TaskFormData(task_id=task_id, form_values_json=task_input.form_values_json)
+            db.add(form_data)
+        else:
+            form_data.form_values_json = task_input.form_values_json
+
+    if task_input.seed_urls is not None:
+        seed_urls = [seed.strip() for seed in task_input.seed_urls if seed and seed.strip()]
+        seed_record = db.query(models.TaskSeed).filter(models.TaskSeed.task_id == task_id).first()
+        if not seed_record:
+            seed_record = models.TaskSeed(task_id=task_id, seed_urls_json=json.dumps(seed_urls))
+            db.add(seed_record)
+        else:
+            seed_record.seed_urls_json = json.dumps(seed_urls)
+
+    task.status = "pending"
+    task.completed_at = None
+    db.commit()
+    db.refresh(task)
+    return get_task_with_counts(task, db)
+
+@app.post("/api/tasks/{task_id}/resume", response_model=schemas.TaskResponse)
+def resume_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task.status = "pending"
+    task.completed_at = None
+    db.commit()
+    start_task_thread(task_id)
+    return get_task_with_counts(task, db)
 
 @app.get("/api/tasks", response_model=List[schemas.TaskResponse])
 def list_tasks(db: Session = Depends(get_db)):

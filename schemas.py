@@ -10,10 +10,22 @@ class TaskCreate(TaskBase):
     seed_urls: Optional[List[str]] = None
     auth_required: Optional[bool] = False
     auth_login_url: Optional[str] = None
+    auth_post_login_url: Optional[str] = None
     auth_username: Optional[str] = None
     auth_password: Optional[str] = None
     auth_otp_code: Optional[str] = None
     auth_otp_hint: Optional[str] = None
+
+class TaskInputUpdate(BaseModel):
+    auth_required: Optional[bool] = None
+    auth_login_url: Optional[str] = None
+    auth_post_login_url: Optional[str] = None
+    auth_username: Optional[str] = None
+    auth_password: Optional[str] = None
+    auth_otp_code: Optional[str] = None
+    auth_otp_hint: Optional[str] = None
+    form_values_json: Optional[str] = None
+    seed_urls: Optional[List[str]] = None
 
 class TaskResponse(BaseModel):
     id: str

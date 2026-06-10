@@ -108,6 +108,7 @@ class TaskAuth(Base):
     task_id = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False, unique=True)
     auth_required = Column(Integer, default=0)
     auth_login_url = Column(String, nullable=True)
+    auth_post_login_url = Column(String, nullable=True)
     auth_username = Column(String, nullable=True)
     auth_password = Column(String, nullable=True)
     auth_otp_code = Column(String, nullable=True)

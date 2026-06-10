@@ -69,9 +69,45 @@ BLOCKED_PAGE_MARKERS = (
     "access denied",
     "attention required",
     "cloudflare",
-    "enable javascript",
     "checking your browser",
 )
+
+
+def looks_like_blocked_page(title: str = "", html_snippet: str = "", body_text: str = "") -> bool:
+    """Detect true bot/challenge pages without flagging normal SPA sign-in screens."""
+    haystack = " ".join([title or "", html_snippet or "", body_text or ""]).lower()
+    if not haystack.strip():
+        return True
+
+    if any(marker in haystack for marker in BLOCKED_PAGE_MARKERS):
+        return True
+
+    javascript_warning = "enable javascript" in haystack or "javascript is required" in haystack
+    challenge_terms = (
+        "checking your browser",
+        "verify you are human",
+        "security check",
+        "ddos protection",
+        "ray id",
+        "cf-browser-verification",
+        "cf-challenge",
+        "captcha",
+    )
+    normal_app_terms = (
+        "sign in",
+        "login",
+        "password",
+        "forgot",
+        "dashboard",
+        "logout",
+        "profile",
+    )
+    if javascript_warning and any(term in haystack for term in challenge_terms):
+        return True
+    if javascript_warning and not any(term in haystack for term in normal_app_terms) and len(haystack) < 500:
+        return True
+
+    return False
 
 
 def aggregate_site_profile(url: str, pages: list) -> dict:
@@ -140,10 +176,7 @@ def aggregate_site_profile(url: str, pages: list) -> dict:
     primary_title = page_titles[0] if page_titles else "Untitled Page"
     title_lower = primary_title.lower()
     first_html = (pages[0].get("html_snippet", "") or "").lower()
-    is_blocked = any(
-        marker in title_lower or marker in first_html
-        for marker in BLOCKED_PAGE_MARKERS
-    )
+    is_blocked = looks_like_blocked_page(primary_title, first_html)
 
     form_field_names = []
     for form in all_forms:
@@ -217,7 +250,7 @@ def build_page_profile(page: dict, base_url: str) -> dict:
         "page_count": 1,
         "image_count": len(images),
         "images_missing_alt": sum(1 for image in images if not image.get("has_alt")),
-        "is_blocked": any(marker in title.lower() or marker in html_snippet.lower() for marker in BLOCKED_PAGE_MARKERS),
+        "is_blocked": looks_like_blocked_page(title, html_snippet),
     }
 
 
@@ -403,7 +436,135 @@ def extract_page_snapshot(page, current_url: str, status_code: int = 200) -> dic
     }
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 12, auth: dict = None, seed_urls: list = None) -> list:
+def expand_navigation_regions(page) -> None:
+    """Try common dashboard toggles so hidden nav/footer links become discoverable."""
+    candidate_selectors = [
+        "button[aria-label*='menu' i]",
+        "button[aria-label*='navigation' i]",
+        "button[aria-label*='sidebar' i]",
+        "button[title*='menu' i]",
+        "button:has-text('Menu')",
+        "button:has-text('Navigation')",
+        "button:has-text('Sidebar')",
+        "button:has-text('More')",
+        "[role='button'][aria-expanded='false']",
+    ]
+    for selector in candidate_selectors:
+        try:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                loc.first.click(timeout=1500)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=2000)
+                except Exception:
+                    pass
+                break
+        except Exception:
+            continue
+
+
+def harvest_navigation_links(page, base_url: str) -> list:
+    """Collect anchors from common navigation regions and normalize them into absolute URLs."""
+    collected = []
+    selectors = [
+        "a[href]",
+        "nav a[href]",
+        "aside a[href]",
+        "header a[href]",
+        "footer a[href]",
+        "[role='navigation'] a[href]",
+    ]
+    seen = set()
+    for selector in selectors:
+        try:
+            hrefs = page.eval_on_selector_all(
+                selector,
+                "elements => elements.map(el => ({href: el.href || el.getAttribute('href') || '', text: (el.innerText || '').trim()})).filter(x => !!x.href)"
+            )
+        except Exception:
+            hrefs = []
+        for item in hrefs:
+            href = item.get("href") or ""
+            text = item.get("text") or ""
+            if href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                continue
+            try:
+                absolute = href if href.startswith("http") else urljoin(base_url, href)
+            except Exception:
+                continue
+            key = absolute.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            collected.append({"href": absolute, "text": text[:100]})
+    return collected
+
+
+def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 12) -> list:
+    """Click dashboard navigation controls and collect routes revealed by client-side routing."""
+    discovered = []
+    blocked_text = ("logout", "log out", "sign out", "delete", "remove", "close", "cancel")
+    candidate_selector = (
+        "nav a, nav button, aside a, aside button, header a, header button, "
+        "footer a, footer button, [role='navigation'] a, [role='navigation'] button"
+    )
+    try:
+        count = min(page.locator(candidate_selector).count(), max_clicks)
+    except Exception:
+        return discovered
+
+    start_url = page.url
+    for index in range(count):
+        try:
+            item = page.locator(candidate_selector).nth(index)
+            label = ((item.inner_text(timeout=1000) or "") + " " + (item.get_attribute("aria-label") or "")).strip().lower()
+            if not label or any(marker in label for marker in blocked_text):
+                continue
+
+            href = item.get_attribute("href")
+            if href and not href.startswith(("javascript:", "mailto:", "tel:", "#")):
+                absolute = href if href.startswith("http") else urljoin(base_url, href)
+                if same_site(absolute, base_url):
+                    discovered.append(absolute)
+                continue
+
+            before_url = page.url
+            item.click(timeout=2000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=3000)
+            except Exception:
+                pass
+
+            after_url = page.url
+            if after_url and after_url != before_url and same_site(after_url, base_url):
+                discovered.append(after_url)
+
+            for nav_link in harvest_navigation_links(page, after_url or base_url):
+                nav_href = nav_link.get("href")
+                if nav_href and same_site(nav_href, base_url):
+                    discovered.append(nav_href)
+
+            if page.url != start_url:
+                try:
+                    page.goto(start_url, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=3000)
+                    except Exception:
+                        pass
+                    expand_navigation_regions(page)
+                except Exception:
+                    pass
+        except Exception:
+            continue
+
+    deduped = []
+    for href in discovered:
+        if href not in deduped:
+            deduped.append(href)
+    return deduped
+
+
+def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = None, seed_urls: list = None) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
@@ -422,6 +583,16 @@ def discover_pages_with_playwright(url: str, max_pages: int = 12, auth: dict = N
                 authenticate_browser_context(context, auth, normalized, logger.info)
             page = context.new_page()
             page.set_default_timeout(20000)
+            if auth and auth.get("auth_required"):
+                try:
+                    page.goto(normalized, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    expand_navigation_regions(page)
+                except Exception:
+                    pass
 
             while queue and len(snapshots) < max_pages:
                 current_url = queue.pop(0)
@@ -449,15 +620,14 @@ def discover_pages_with_playwright(url: str, max_pages: int = 12, auth: dict = N
                     logger.error(f"Failed to extract snapshot for {current_url}: {exc}")
                     continue
 
-                try:
-                    link_hrefs = page.eval_on_selector_all("a[href]", "elements => elements.map(el => el.href).filter(h => !!h)")
-                except Exception:
-                    link_hrefs = []
+                link_hrefs = harvest_navigation_links(page, current_url)
+                clicked_hrefs = click_navigation_items_for_routes(page, current_url)
 
-                for href in link_hrefs:
-                    if href and same_site(href, normalized) and href not in visited and href not in queue:
+                for href in link_hrefs + clicked_hrefs:
+                    candidate_href = href.get("href") if isinstance(href, dict) else href
+                    if candidate_href and same_site(candidate_href, normalized) and candidate_href not in visited and candidate_href not in queue:
                         if len(queue) + len(snapshots) < max_pages:
-                            queue.append(href)
+                            queue.append(candidate_href)
 
             context.close()
             browser.close()
@@ -736,6 +906,7 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
         return False
 
     login_url = normalize_url(auth.get("auth_login_url") or start_url)
+    post_login_url = normalize_url(auth.get("auth_post_login_url") or "")
     username = auth.get("auth_username") or ""
     password = auth.get("auth_password") or ""
     otp_code = auth.get("auth_otp_code") or ""
@@ -806,6 +977,12 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
         if submitted:
             try:
                 page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
+
+        if post_login_url:
+            try:
+                page.goto(post_login_url, wait_until="domcontentloaded")
             except Exception:
                 pass
 
@@ -937,9 +1114,8 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
                 console_messages = []
             if status >= 400:
                 return "failed", f"Manual blocker check on {domain} found HTTP {status}. Visible body preview: {body_text[:240] or 'empty body'}", "critical"
-            blocker_hits = [marker for marker in BLOCKED_PAGE_MARKERS if marker in body_text.lower()]
-            if blocker_hits:
-                return "failed", f"Manual blocker check on {domain} found blocking text: {', '.join(blocker_hits)}.", "high"
+            if looks_like_blocked_page(page.title(), page.content()[:2500], body_text):
+                return "failed", f"Manual blocker check on {domain} found bot-protection or challenge content.", "high"
             if len(body_text) < 40:
                 return "failed", f"Manual blocker check on {domain} found almost no visible content. Body preview: {body_text[:240] or 'empty body'}", "high"
             if console_messages:
@@ -1812,11 +1988,25 @@ def run_testing_agent(task_id: str):
             auth_data = {
                 "auth_required": bool(auth.auth_required),
                 "auth_login_url": auth.auth_login_url,
+                "auth_post_login_url": auth.auth_post_login_url,
                 "auth_username": auth.auth_username,
                 "auth_password": auth.auth_password,
                 "auth_otp_code": auth.auth_otp_code,
                 "auth_otp_hint": auth.auth_otp_hint,
             }
+            if auth.auth_post_login_url:
+                seed_urls.append(auth.auth_post_login_url)
+
+        if auth_data and auth_data.get("auth_required") and (not (auth_data.get("auth_username") or "").strip() or not (auth_data.get("auth_password") or "").strip()):
+            task.status = "needs_input"
+            db.commit()
+            if orchestrator_state:
+                orchestrator_state.status = "failed"
+                orchestrator_state.log_output = (orchestrator_state.log_output or "") + "[Orchestrator] Paused: authentication credentials are required to continue.\n"
+                orchestrator_state.completed_at = datetime.utcnow()
+                db.commit()
+            logger.info(f"Task {task_id} paused awaiting authentication input.")
+            return
 
         if task.url:
             normalized_task_url = normalize_url(task.url)
