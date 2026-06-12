@@ -113,6 +113,9 @@ class TaskAuth(Base):
     auth_password = Column(String, nullable=True)
     auth_otp_code = Column(String, nullable=True)
     auth_otp_hint = Column(String, nullable=True)
+    auth_flow = Column(String, nullable=True)
+    auth_next_step = Column(String, nullable=True)
+    auth_required_fields = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("Task", back_populates="auth")

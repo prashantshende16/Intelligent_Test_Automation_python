@@ -26,6 +26,15 @@ def ensure_task_auth_columns():
     if "auth_post_login_url" not in columns:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE task_auths ADD COLUMN auth_post_login_url VARCHAR"))
+    if "auth_next_step" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task_auths ADD COLUMN auth_next_step VARCHAR"))
+    if "auth_required_fields" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task_auths ADD COLUMN auth_required_fields TEXT"))
+    if "auth_flow" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE task_auths ADD COLUMN auth_flow VARCHAR"))
 
 ensure_task_auth_columns()
 
@@ -34,11 +43,19 @@ app = FastAPI(title="AI Website Testing Automation API")
 # Enable CORS for frontend app
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In development, allow all origins
+    # FastAPI/Starlette does not allow allow_credentials=True with allow_origins=["*"].
+    # Use explicit origins during development.
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 def get_task_with_counts(task: models.Task, db: Session) -> schemas.TaskResponse:
     """Helper function to calculate counts for a single task."""
@@ -101,6 +118,9 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
             auth_password=task_in.auth_password,
             auth_otp_code=task_in.auth_otp_code,
             auth_otp_hint=task_in.auth_otp_hint,
+            auth_flow=task_in.auth_flow,
+            auth_next_step=task_in.auth_next_step,
+            auth_required_fields=task_in.auth_required_fields,
         )
         db.add(db_auth)
 
@@ -156,6 +176,12 @@ def update_task_input(task_id: str, task_input: schemas.TaskInputUpdate, db: Ses
             auth.auth_otp_code = task_input.auth_otp_code
         if task_input.auth_otp_hint is not None:
             auth.auth_otp_hint = task_input.auth_otp_hint
+        if task_input.auth_flow is not None:
+            auth.auth_flow = task_input.auth_flow
+        if task_input.auth_next_step is not None:
+            auth.auth_next_step = task_input.auth_next_step
+        if task_input.auth_required_fields is not None:
+            auth.auth_required_fields = task_input.auth_required_fields
 
     if task_input.form_values_json is not None:
         form_data = db.query(models.TaskFormData).filter(models.TaskFormData.task_id == task_id).first()
@@ -222,6 +248,28 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
     auth = db.query(models.TaskAuth).filter(models.TaskAuth.task_id == task_id).first()
     seeds = db.query(models.TaskSeed).filter(models.TaskSeed.task_id == task_id).first()
     agent_states = db.query(models.AgentState).filter(models.AgentState.task_id == task_id).order_by(models.AgentState.started_at.asc()).all()
+    auth_state = None
+    if auth:
+        required_fields = []
+        if auth.auth_required_fields:
+            try:
+                parsed_fields = json.loads(auth.auth_required_fields)
+                if isinstance(parsed_fields, list):
+                    required_fields = parsed_fields
+            except Exception:
+                required_fields = [auth.auth_required_fields]
+        auth_state = {
+            "required": bool(auth.auth_required),
+            "flow": auth.auth_flow,
+            "next_step": auth.auth_next_step,
+            "required_fields": required_fields,
+            "login_url": auth.auth_login_url,
+            "post_login_url": auth.auth_post_login_url,
+            "username": auth.auth_username,
+            "password_set": bool((auth.auth_password or "").strip()),
+            "otp_set": bool((auth.auth_otp_code or "").strip()),
+            "otp_hint": auth.auth_otp_hint,
+        }
     
     return schemas.TaskDetailsResponse(
         task=task_resp,
@@ -231,6 +279,7 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
         suggestions=suggestions,
         codebase=codebase,
         auth=auth,
+        auth_state=auth_state,
         seeds=seeds,
         agent_states=agent_states
     )

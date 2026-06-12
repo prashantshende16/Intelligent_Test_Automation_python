@@ -900,10 +900,160 @@ def save_screenshot(page, path: str) -> None:
         logger.warning(f"Screenshot save failed: {exc}")
 
 
+def _normalize_text(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _classify_auth_field(name: str = "", field_id: str = "", placeholder: str = "", label: str = "", aria: str = "") -> str:
+    haystack = _normalize_text(" ".join([name, field_id, placeholder, label, aria]))
+    if not haystack:
+        return "unknown"
+
+    if any(term in haystack for term in ["captcha", "recaptcha", "hcaptcha", "verify you are human", "cloudflare", "challenge"]):
+        return "challenge"
+
+    if any(term in haystack for term in ["otp", "one time", "verification code", "verification", "auth code", "security code", "passcode", "pin", "token"]):
+        return "otp"
+
+    # More reliable mobile identifier detection (covers Sellingo-style ids like user_mobile_login)
+    if any(term in haystack for term in [
+        "mobile", "phone", "cell", "whatsapp",
+        "user_mobile", "user phone", "user-phone",
+        "mobile_login", "phone_login", "phone number",
+        "phone number", "cell phone",
+        "msisdn",
+    ]):
+        return "mobile"
+
+    if "email" in haystack:
+        return "email"
+
+    if any(term in haystack for term in ["password", "passcode", "pin"]):
+        return "password"
+
+    if any(term in haystack for term in ["user", "login", "account", "username"]):
+        return "username"
+
+    return "unknown"
+
+
+
+def _field_metadata(page, locator) -> dict:
+    try:
+        field_id = locator.get_attribute("id") or ""
+        label_text = ""
+        if field_id:
+            try:
+                label_loc = page.locator(f"label[for='{field_id}']")
+                if label_loc.count() > 0:
+                    label_text = label_loc.first.inner_text(timeout=1000) or ""
+            except Exception:
+                label_text = ""
+        return {
+            "name": locator.get_attribute("name") or "",
+            "id": field_id,
+            "placeholder": locator.get_attribute("placeholder") or "",
+            "type": locator.get_attribute("type") or "",
+            "aria": locator.get_attribute("aria-label") or "",
+            "autocomplete": locator.get_attribute("autocomplete") or "",
+            "label": label_text,
+        }
+    except Exception:
+        return {}
+
+
+def _discover_auth_form(page) -> dict:
+    inputs = []
+    try:
+        for i in range(page.locator("input").count()):
+            loc = page.locator("input").nth(i)
+            meta = _field_metadata(page, loc)
+            meta["role"] = _classify_auth_field(meta.get("name", ""), meta.get("id", ""), meta.get("placeholder", ""), meta.get("label", ""), meta.get("aria", ""))
+            inputs.append(meta)
+    except Exception:
+        pass
+
+    buttons = []
+    try:
+        for i in range(page.locator("button").count()):
+            loc = page.locator("button").nth(i)
+            buttons.append({
+                "text": _normalize_text(loc.inner_text(timeout=1000) or ""),
+                "type": loc.get_attribute("type") or "",
+            })
+    except Exception:
+        pass
+
+    body_text = ""
+    try:
+        body_text = _normalize_text(page.locator("body").inner_text(timeout=3000) or "")
+    except Exception:
+        pass
+
+    return {"inputs": inputs, "buttons": buttons, "body_text": body_text}
+
+
+def _detect_challenge_text(page_text: str, url: str) -> bool:
+    challenge_terms = (
+        "cloudflare",
+        "captcha",
+        "recaptcha",
+        "hcaptcha",
+        "verify you are human",
+        "checking your browser",
+        "security check",
+        "challenge",
+        "cf-challenge",
+    )
+    url_text = _normalize_text(url)
+    haystack = f"{page_text} {url_text}"
+    return any(term in haystack for term in challenge_terms)
+
+
+def _auth_issue_to_fields(issue: dict) -> list:
+    issue_type = (issue or {}).get("type", "")
+    fields = (issue or {}).get("fields") or []
+    if fields:
+        return fields
+    mapping = {
+        "missing_input": [],
+        "otp_required": ["otp"],
+        "password_required": ["password"],
+        "mobile_required": ["mobile"],
+        "email_required": ["email"],
+        "challenge": ["challenge"],
+    }
+    return mapping.get(issue_type, [])
+
+
+def _classify_auth_flow(required_fields: list) -> str:
+    fields = [str(field or "").lower() for field in required_fields or []]
+    joined = " ".join(fields)
+    if "mobile" in joined and "otp" in joined:
+        return "mobile_otp"
+    if "email" in joined and "otp" in joined:
+        return "email_otp"
+    if "password" in joined and "otp" in joined:
+        return "password_reset"
+    if "otp" in joined:
+        return "otp"
+    if "password" in joined:
+        return "password"
+    if any(field in {"mobile", "email", "username"} for field in fields):
+        return "identifier"
+    if "challenge" in fields:
+        return "challenge"
+    return "general"
+
+
 def authenticate_browser_context(context, auth: dict, start_url: str, log_callback=None) -> bool:
     """Attempt a lightweight login flow when credentials are provided."""
     if not auth or not auth.get("auth_required"):
         return False
+    try:
+        auth["_codex_auth_issue"] = None
+    except Exception:
+        pass
 
     login_url = normalize_url(auth.get("auth_login_url") or start_url)
     post_login_url = normalize_url(auth.get("auth_post_login_url") or "")
@@ -917,6 +1067,13 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
         if log_callback:
             log_callback(f"[Orchestrator] Attempting authenticated session via {login_url}")
         page.goto(login_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
+
+        snapshot = _discover_auth_form(page)
+        if _detect_challenge_text(snapshot.get("body_text", ""), page.url):
+            if log_callback:
+                log_callback(f"[Orchestrator] Bot/challenge screen detected at {page.url}. Waiting for manual verification or a human-assisted step.")
+            return False
 
         def fill_first(selectors, value):
             for selector in selectors:
@@ -929,30 +1086,86 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                         continue
             return False
 
-        if username:
-            fill_first([
+        field_values = {
+            "mobile": username,
+            "email": username,
+            "username": username,
+            "password": password,
+            "otp": otp_code,
+        }
+
+        field_selectors = {
+            "mobile": [
+                "input[name*='mobile' i]",
+                "input[id*='mobile' i]",
+                "input[placeholder*='mobile' i]",
+                "input[name*='phone' i]",
+                "input[id*='phone' i]",
+                "input[placeholder*='phone' i]",
+            ],
+            "email": [
                 "input[type='email']",
-                "input[name*='user' i]",
                 "input[name*='email' i]",
-                "input[name*='login' i]",
                 "input[placeholder*='email' i]",
+            ],
+            "username": [
+                "input[name*='user' i]",
+                "input[name*='login' i]",
+                "input[name*='account' i]",
                 "input[placeholder*='user' i]",
                 "input[type='text']",
-            ], username)
-        if password:
-            fill_first([
+            ],
+            "password": [
                 "input[type='password']",
                 "input[name*='pass' i]",
                 "input[placeholder*='password' i]",
-            ], password)
-        if otp_code:
-            fill_first([
+            ],
+            "otp": [
                 "input[name*='otp' i]",
                 "input[name*='code' i]",
                 "input[name*='token' i]",
+                "input[name*='verify' i]",
                 "input[placeholder*='otp' i]",
                 "input[placeholder*='code' i]",
-            ], otp_code)
+                "input[placeholder*='security' i]",
+            ],
+        }
+
+        field_roles = [field.get("role") for field in snapshot.get("inputs", [])]
+
+        if log_callback:
+            # Debug: what auth form inputs the detector saw
+            try:
+                inputs_debug = [
+                    {
+                        "role": (f.get("role") or "unknown"),
+                        "name": f.get("name") or "",
+                        "id": f.get("id") or "",
+                        "placeholder": f.get("placeholder") or "",
+                        "label": f.get("label") or "",
+                        "type": f.get("type") or "",
+                        "aria": f.get("aria") or "",
+                    }
+                    for f in (snapshot.get("inputs", []) or [])
+                ]
+                log_callback(f"[Orchestrator][AuthDebug] Detected login inputs at {page.url}: {json.dumps(inputs_debug, ensure_ascii=False)}")
+            except Exception:
+                pass
+
+        ordered_roles = []
+        for role in ["mobile", "email", "username", "password", "otp"]:
+            if role in field_roles or role == "password" or role == "otp":
+                ordered_roles.append(role)
+
+        matched_any = False
+        for role in ordered_roles:
+            value = field_values.get(role) or ""
+            if not value:
+                continue
+            if fill_first(field_selectors.get(role, []), value):
+                matched_any = True
+                if log_callback:
+                    log_callback(f"[Orchestrator] Filled detected {role} field at {page.url}.")
 
         submit_selectors = [
             "button[type='submit']",
@@ -960,6 +1173,10 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
             "button:has-text('Login')",
             "button:has-text('Sign in')",
             "button:has-text('Submit')",
+            "button:has-text('Verify')",
+            "button:has-text('Continue')",
+            "button:has-text('Next')",
+            "button:has-text('Send')",
             "text=Login",
             "text=Sign in",
         ]
@@ -979,6 +1196,73 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                 page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 pass
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
+        snapshot = _discover_auth_form(page)
+
+        if log_callback:
+            try:
+                post_inputs_debug = [
+                    {
+                        "role": (f.get("role") or "unknown"),
+                        "name": f.get("name") or "",
+                        "id": f.get("id") or "",
+                        "placeholder": f.get("placeholder") or "",
+                        "label": f.get("label") or "",
+                        "type": f.get("type") or "",
+                        "aria": f.get("aria") or "",
+                    }
+                    for f in (snapshot.get("inputs", []) or [])
+                ]
+                log_callback(
+                    f"[Orchestrator][AuthDebug] After submit @ {page.url}: inputs={json.dumps(post_inputs_debug, ensure_ascii=False)} "
+                    f"body_len={len(snapshot.get('body_text','') or '')}"
+                )
+            except Exception:
+                pass
+
+        if _detect_challenge_text(snapshot.get("body_text", ""), page.url):
+            if log_callback:
+                log_callback(f"[Orchestrator] Bot/challenge screen detected after submit at {page.url}. Manual verification is required.")
+            return False
+
+        input_roles = [field.get("role") for field in snapshot.get("inputs", [])]
+        if log_callback:
+            try:
+                log_callback(f"[Orchestrator][AuthDebug] Post-submit detected input roles: {sorted(set(input_roles))}")
+            except Exception:
+                pass
+
+        login_roles = [role for role in input_roles if role in {"mobile", "email", "username", "password", "otp"}]
+        missing_roles = []
+        for role in login_roles:
+            if role in {"mobile", "email", "username"} and not username:
+                missing_roles.append(role)
+            elif role == "password" and not password:
+                missing_roles.append(role)
+            elif role == "otp" and not otp_code:
+                missing_roles.append(role)
+        if missing_roles:
+            issue = {
+                "type": "missing_input",
+                "fields": sorted(set(missing_roles)),
+                "page_url": page.url,
+            }
+            try:
+                required_fields = sorted(set(missing_roles))
+                auth["_codex_auth_issue"] = issue
+                auth["auth_next_step"] = "Provide the missing authentication field(s)"
+                auth["auth_required_fields"] = json.dumps(required_fields)
+                auth["auth_flow"] = _classify_auth_flow(required_fields)
+            except Exception:
+                pass
+            if log_callback:
+                needed = ", ".join(sorted(set(missing_roles)))
+                log_callback(f"[Orchestrator] Login flow requires missing input(s): {needed}. Pause and collect these values before resuming.")
+            return False
 
         if post_login_url:
             try:
@@ -986,16 +1270,53 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
             except Exception:
                 pass
 
-        success_markers = ["logout", "sign out", "my account", "dashboard", "profile", "member area"]
+        # Re-scan page for auth challenge / OTP presence BEFORE declaring success.
+        snapshot = _discover_auth_form(page)
+        if _detect_challenge_text(snapshot.get("body_text", ""), page.url):
+            if log_callback:
+                log_callback(f"[Orchestrator] Bot/challenge screen detected after submit at {page.url}. Manual verification is required.")
+            return False
+
+        input_roles = [field.get("role") for field in snapshot.get("inputs", [])]
+        # If OTP is present and we didn't provide it, we must pause.
+        if "otp" in input_roles and not otp_code:
+            issue = {
+                "type": "otp_required",
+                "fields": ["otp"],
+                "page_url": page.url,
+            }
+            try:
+                auth["_codex_auth_issue"] = issue
+                auth["auth_next_step"] = "Provide the OTP / verification code"
+                auth["auth_required_fields"] = json.dumps(["otp"])
+                auth["auth_flow"] = _classify_auth_flow(["otp"])
+            except Exception:
+                pass
+            if log_callback:
+                log_callback("[Orchestrator] OTP input detected but no OTP provided. Pause and wait for OTP.")
+            return False
+
+        success_markers = ["logout", "sign out", "my account", "profile", "member area"]
         body_text = (page.locator("body").inner_text(timeout=5000) or "").lower()
+        current_url = (page.url or "").lower()
+        on_login_page = "login" in current_url or "sign-in" in current_url or "signin" in current_url
+
+        # Prefer explicit authenticated markers; do not rely solely on redirect.
         if any(marker in body_text for marker in success_markers):
             if log_callback:
-                log_callback(f"[Orchestrator] Authenticated session appears active at {login_url}")
+                log_callback(f"[Orchestrator] Authenticated session appears active at {page.url}")
             return True
 
+        # If we redirected away from login, treat as "submitted" but still keep safety: only success if URL is post-login.
+        if post_login_url and page.url.rstrip("/") == post_login_url.rstrip("/") and not on_login_page:
+            if log_callback:
+                log_callback(f"[Orchestrator] Authentication likely succeeded by redirect to post-login URL: {page.url}")
+            return submitted
+
         if log_callback:
-            log_callback(f"[Orchestrator] Authentication attempt completed, but success markers were not detected at {login_url}")
+            log_callback(f"[Orchestrator] Authentication attempt completed, but authenticated markers were not detected at {page.url}")
         return submitted
+
     except Exception as exc:
         if log_callback:
             log_callback(f"[Orchestrator] Authentication attempt failed: {exc}")
@@ -1993,16 +2314,23 @@ def run_testing_agent(task_id: str):
                 "auth_password": auth.auth_password,
                 "auth_otp_code": auth.auth_otp_code,
                 "auth_otp_hint": auth.auth_otp_hint,
+                "auth_flow": auth.auth_flow,
+                "auth_next_step": auth.auth_next_step,
+                "auth_required_fields": auth.auth_required_fields,
             }
             if auth.auth_post_login_url:
                 seed_urls.append(auth.auth_post_login_url)
 
-        if auth_data and auth_data.get("auth_required") and (not (auth_data.get("auth_username") or "").strip() or not (auth_data.get("auth_password") or "").strip()):
+        if auth_data and auth_data.get("auth_required") and not any([
+            (auth_data.get("auth_username") or "").strip(),
+            (auth_data.get("auth_password") or "").strip(),
+            (auth_data.get("auth_otp_code") or "").strip(),
+        ]):
             task.status = "needs_input"
             db.commit()
             if orchestrator_state:
                 orchestrator_state.status = "failed"
-                orchestrator_state.log_output = (orchestrator_state.log_output or "") + "[Orchestrator] Paused: authentication credentials are required to continue.\n"
+                orchestrator_state.log_output = (orchestrator_state.log_output or "") + "[Orchestrator] Paused: at least one authentication credential is required to continue.\n"
                 orchestrator_state.completed_at = datetime.utcnow()
                 db.commit()
             logger.info(f"Task {task_id} paused awaiting authentication input.")
@@ -2029,6 +2357,28 @@ def run_testing_agent(task_id: str):
             write_orchestrator_log(f"[Orchestrator] Seeded pages: {', '.join(seed_urls)}")
 
         page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls)
+        auth_issue = (auth_data or {}).get("_codex_auth_issue")
+        if auth_issue:
+            if auth:
+                auth.auth_next_step = "Provide the missing authentication field(s)"
+                try:
+                    required_fields = list(auth_issue.get("fields", []))
+                    auth.auth_required_fields = json.dumps(required_fields)
+                    auth.auth_flow = _classify_auth_flow(required_fields)
+                except Exception:
+                    auth.auth_required_fields = None
+                    auth.auth_flow = None
+                db.commit()
+            task.status = "needs_input"
+            db.commit()
+            if orchestrator_state:
+                orchestrator_state.status = "failed"
+                needed = ", ".join(auth_issue.get("fields", [])) or "authentication input"
+                orchestrator_state.log_output = (orchestrator_state.log_output or "") + f"[Orchestrator] Paused: login flow needs {needed}.\n"
+                orchestrator_state.completed_at = datetime.utcnow()
+                db.commit()
+            logger.info(f"Task {task_id} paused awaiting auth input: {auth_issue}")
+            return
         discovered_urls = [snap.get("page_url", "") for snap in page_snapshots if snap.get("page_url")]
         write_orchestrator_log(f"[Orchestrator] Discovered pages: {', '.join(discovered_urls) if discovered_urls else 'none'}")
         write_orchestrator_log(f"[Orchestrator] Discovered {len(page_snapshots)} page snapshots.")
@@ -2101,6 +2451,28 @@ def run_testing_agent(task_id: str):
 
         time.sleep(2.5)
         error_ids = execute_test_plan(task.id, page_snapshots, use_cases_mapping, use_case_titles, auth=auth_data, log_callback=write_orchestrator_log)
+        auth_issue = (auth_data or {}).get("_codex_auth_issue")
+        if auth_issue:
+            if auth:
+                auth.auth_next_step = "Provide the missing authentication field(s)"
+                try:
+                    required_fields = list(auth_issue.get("fields", []))
+                    auth.auth_required_fields = json.dumps(required_fields)
+                    auth.auth_flow = _classify_auth_flow(required_fields)
+                except Exception:
+                    auth.auth_required_fields = None
+                    auth.auth_flow = None
+                db.commit()
+            task.status = "needs_input"
+            db.commit()
+            if orchestrator_state:
+                orchestrator_state.status = "failed"
+                needed = ", ".join(auth_issue.get("fields", [])) or "authentication input"
+                orchestrator_state.log_output = (orchestrator_state.log_output or "") + f"[Orchestrator] Paused: login flow needs {needed}.\n"
+                orchestrator_state.completed_at = datetime.utcnow()
+                db.commit()
+            logger.info(f"Task {task_id} paused awaiting auth input: {auth_issue}")
+            return
         write_orchestrator_log(f"[Orchestrator] Browser validations completed with {len(error_ids)} error(s).")
 
         if codebase and error_ids:

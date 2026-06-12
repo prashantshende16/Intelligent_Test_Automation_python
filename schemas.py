@@ -15,6 +15,9 @@ class TaskCreate(TaskBase):
     auth_password: Optional[str] = None
     auth_otp_code: Optional[str] = None
     auth_otp_hint: Optional[str] = None
+    auth_flow: Optional[str] = None
+    auth_next_step: Optional[str] = None
+    auth_required_fields: Optional[str] = None
 
 class TaskInputUpdate(BaseModel):
     auth_required: Optional[bool] = None
@@ -24,6 +27,9 @@ class TaskInputUpdate(BaseModel):
     auth_password: Optional[str] = None
     auth_otp_code: Optional[str] = None
     auth_otp_hint: Optional[str] = None
+    auth_flow: Optional[str] = None
+    auth_next_step: Optional[str] = None
+    auth_required_fields: Optional[str] = None
     form_values_json: Optional[str] = None
     seed_urls: Optional[List[str]] = None
 
@@ -74,7 +80,7 @@ class CodebaseResponse(BaseModel):
     local_path: str
     framework_type: str
     file_tree: Optional[str] = None
-    analyzed_at: datetime
+    analyzed_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -88,6 +94,9 @@ class TaskAuthResponse(BaseModel):
     auth_password: Optional[str] = None
     auth_otp_code: Optional[str] = None
     auth_otp_hint: Optional[str] = None
+    auth_flow: Optional[str] = None
+    auth_next_step: Optional[str] = None
+    auth_required_fields: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -109,7 +118,7 @@ class AgentStateResponse(BaseModel):
     status: str
     errors_found: int
     log_output: Optional[str] = None
-    started_at: datetime
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
     class Config:
@@ -160,6 +169,7 @@ class TaskDetailsResponse(BaseModel):
     suggestions: List[SuggestionResponse]
     codebase: Optional[CodebaseResponse] = None
     auth: Optional[TaskAuthResponse] = None
+    auth_state: Optional[Dict] = None
     seeds: Optional[TaskSeedResponse] = None
     agent_states: List[AgentStateResponse] = []
 
