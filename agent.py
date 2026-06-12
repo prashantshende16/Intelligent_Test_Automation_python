@@ -935,7 +935,12 @@ def _classify_auth_field(name: str = "", field_id: str = "", placeholder: str = 
     if any(term in haystack for term in ["password", "passcode", "pin"]):
         return "password"
 
-    if any(term in haystack for term in ["user", "login", "account", "username"]):
+    if any(term in haystack for term in [
+        "user", "login", "account", "username",
+        "customer", "consumer", "client", "member",
+        "staff", "employee", "card number", "card_number",
+        "merchant", "partner", "id", "identity",
+    ]):
         return "username"
 
     return "unknown"
@@ -1164,7 +1169,7 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                         for j in range(loc.count()):
                             trigger = loc.nth(j)
                             if trigger.is_visible():
-                                trigger.click()
+                                trigger.click(timeout=2000)
                                 clicked_trigger = True
                                 break
                         if clicked_trigger:
@@ -1185,14 +1190,14 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                     el = loc.nth(j)
                     if el.is_visible():
                         try:
-                            el.fill(value)
+                            el.fill(value, timeout=2000)
                             return True
                         except Exception:
                             pass
                 # Fallback to normal first match
                 if count > 0:
                     try:
-                        loc.first.fill(value)
+                        loc.first.fill(value, timeout=2000)
                         return True
                     except Exception:
                         pass
@@ -1208,38 +1213,68 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
 
         field_selectors = {
             "mobile": [
-                "input[name*='mobile' i]",
-                "input[id*='mobile' i]",
-                "input[placeholder*='mobile' i]",
-                "input[name*='phone' i]",
-                "input[id*='phone' i]",
-                "input[placeholder*='phone' i]",
+                "input:not([type='hidden'])[name*='mobile' i]",
+                "input:not([type='hidden'])[id*='mobile' i]",
+                "input:not([type='hidden'])[placeholder*='mobile' i]",
+                "input:not([type='hidden'])[name*='phone' i]",
+                "input:not([type='hidden'])[id*='phone' i]",
+                "input:not([type='hidden'])[placeholder*='phone' i]",
             ],
             "email": [
-                "input[type='email']",
-                "input[name*='email' i]",
-                "input[placeholder*='email' i]",
+                "input:not([type='hidden'])[type='email']",
+                "input:not([type='hidden'])[name*='email' i]",
+                "input:not([type='hidden'])[placeholder*='email' i]",
             ],
             "username": [
-                "input[name*='user' i]",
-                "input[name*='login' i]",
-                "input[name*='account' i]",
-                "input[placeholder*='user' i]",
-                "input[type='text']",
+                "input:not([type='hidden'])[name*='user' i]",
+                "input:not([type='hidden'])[name*='login' i]",
+                "input:not([type='hidden'])[name*='account' i]",
+                "input:not([type='hidden'])[placeholder*='user' i]",
+                "input:not([type='hidden'])[name*='customer' i]",
+                "input:not([type='hidden'])[id*='customer' i]",
+                "input:not([type='hidden'])[placeholder*='customer' i]",
+                "input:not([type='hidden'])[name*='consumer' i]",
+                "input:not([type='hidden'])[id*='consumer' i]",
+                "input:not([type='hidden'])[placeholder*='consumer' i]",
+                "input:not([type='hidden'])[name*='client' i]",
+                "input:not([type='hidden'])[id*='client' i]",
+                "input:not([type='hidden'])[placeholder*='client' i]",
+                "input:not([type='hidden'])[name*='member' i]",
+                "input:not([type='hidden'])[id*='member' i]",
+                "input:not([type='hidden'])[placeholder*='member' i]",
+                "input:not([type='hidden'])[name*='staff' i]",
+                "input:not([type='hidden'])[id*='staff' i]",
+                "input:not([type='hidden'])[placeholder*='staff' i]",
+                "input:not([type='hidden'])[name*='employee' i]",
+                "input:not([type='hidden'])[id*='employee' i]",
+                "input:not([type='hidden'])[placeholder*='employee' i]",
+                "input:not([type='hidden'])[name*='merchant' i]",
+                "input:not([type='hidden'])[id*='merchant' i]",
+                "input:not([type='hidden'])[placeholder*='merchant' i]",
+                "input:not([type='hidden'])[name*='partner' i]",
+                "input:not([type='hidden'])[id*='partner' i]",
+                "input:not([type='hidden'])[placeholder*='partner' i]",
+                "input:not([type='hidden'])[name*='id' i]",
+                "input:not([type='hidden'])[id*='id' i]",
+                "input:not([type='hidden'])[placeholder*='id' i]",
+                "input:not([type='hidden'])[name*='identity' i]",
+                "input:not([type='hidden'])[id*='identity' i]",
+                "input:not([type='hidden'])[placeholder*='identity' i]",
+                "input:not([type='hidden'])[type='text']",
             ],
             "password": [
-                "input[type='password']",
-                "input[name*='pass' i]",
-                "input[placeholder*='password' i]",
+                "input:not([type='hidden'])[type='password']",
+                "input:not([type='hidden'])[name*='pass' i]",
+                "input:not([type='hidden'])[placeholder*='password' i]",
             ],
             "otp": [
-                "input[name*='otp' i]",
-                "input[name*='code' i]",
-                "input[name*='token' i]",
-                "input[name*='verify' i]",
-                "input[placeholder*='otp' i]",
-                "input[placeholder*='code' i]",
-                "input[placeholder*='security' i]",
+                "input:not([type='hidden'])[name*='otp' i]",
+                "input:not([type='hidden'])[name*='code' i]",
+                "input:not([type='hidden'])[name*='token' i]",
+                "input:not([type='hidden'])[name*='verify' i]",
+                "input:not([type='hidden'])[placeholder*='otp' i]",
+                "input:not([type='hidden'])[placeholder*='code' i]",
+                "input:not([type='hidden'])[placeholder*='security' i]",
             ],
         }
 
@@ -1300,7 +1335,7 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                 for j in range(count):
                     btn = loc.nth(j)
                     if btn.is_visible():
-                        btn.click()
+                        btn.click(timeout=2000)
                         submitted = True
                         break
                 if submitted:
@@ -1314,7 +1349,7 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                 try:
                     loc = page.locator(selector)
                     if loc.count() > 0:
-                        loc.first.click()
+                        loc.first.click(timeout=2000)
                         submitted = True
                         break
                 except Exception:
