@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import logging
@@ -578,7 +579,10 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
         logger.info(f"Starting Playwright crawl for {normalized}")
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(ignore_https_errors=True)
+            context = browser.new_context(
+                ignore_https_errors=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
             if auth and auth.get("auth_required"):
                 authenticate_browser_context(context, auth, normalized, logger.info)
             page = context.new_page()
@@ -946,7 +950,7 @@ def _field_metadata(page, locator) -> dict:
             try:
                 label_loc = page.locator(f"label[for='{field_id}']")
                 if label_loc.count() > 0:
-                    label_text = label_loc.first.inner_text(timeout=1000) or ""
+                    label_text = label_loc.first.text_content() or ""
             except Exception:
                 label_text = ""
         return {
@@ -963,34 +967,82 @@ def _field_metadata(page, locator) -> dict:
 
 
 def _discover_auth_form(page) -> dict:
-    inputs = []
+    js_code = """
+    () => {
+        const inputs = Array.from(document.querySelectorAll('input, select, textarea'));
+        const inputData = inputs.map(el => {
+            let labelText = '';
+            const id = el.id || '';
+            if (id) {
+                try {
+                    const escapedId = CSS.escape(id);
+                    const label = document.querySelector(`label[for="${escapedId}"]`);
+                    if (label) {
+                        labelText = (label.textContent || '').trim();
+                    }
+                } catch (e) {}
+            }
+            
+            let isVisible = false;
+            try {
+                const style = window.getComputedStyle(el);
+                isVisible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden' &&
+                            style.opacity !== '0';
+            } catch (e) {}
+            
+            return {
+                name: el.getAttribute('name') || '',
+                id: id,
+                placeholder: el.getAttribute('placeholder') || '',
+                type: el.getAttribute('type') || el.tagName.toLowerCase(),
+                aria: el.getAttribute('aria-label') || '',
+                autocomplete: el.getAttribute('autocomplete') || '',
+                label: labelText,
+                visible: isVisible
+            };
+        });
+        
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const buttonData = buttons.map(el => {
+            return {
+                text: (el.innerText || '').trim(),
+                type: el.getAttribute('type') || ''
+            };
+        });
+        
+        const bodyText = (document.body ? document.body.innerText : '') || '';
+        
+        return {
+            inputs: inputData,
+            buttons: buttonData,
+            body_text: bodyText
+        };
+    }
+    """
     try:
-        for i in range(page.locator("input").count()):
-            loc = page.locator("input").nth(i)
-            meta = _field_metadata(page, loc)
-            meta["role"] = _classify_auth_field(meta.get("name", ""), meta.get("id", ""), meta.get("placeholder", ""), meta.get("label", ""), meta.get("aria", ""))
-            inputs.append(meta)
-    except Exception:
-        pass
-
-    buttons = []
-    try:
-        for i in range(page.locator("button").count()):
-            loc = page.locator("button").nth(i)
+        data = page.evaluate(js_code)
+        inputs = data["inputs"]
+        for meta in inputs:
+            meta["role"] = _classify_auth_field(
+                meta.get("name", ""),
+                meta.get("id", ""),
+                meta.get("placeholder", ""),
+                meta.get("label", ""),
+                meta.get("aria", "")
+            )
+        buttons = []
+        for btn in data["buttons"]:
             buttons.append({
-                "text": _normalize_text(loc.inner_text(timeout=1000) or ""),
-                "type": loc.get_attribute("type") or "",
+                "text": _normalize_text(btn["text"]),
+                "type": btn["type"],
             })
-    except Exception:
-        pass
-
-    body_text = ""
-    try:
-        body_text = _normalize_text(page.locator("body").inner_text(timeout=3000) or "")
-    except Exception:
-        pass
-
-    return {"inputs": inputs, "buttons": buttons, "body_text": body_text}
+        body_text = _normalize_text(data["body_text"])
+        return {"inputs": inputs, "buttons": buttons, "body_text": body_text}
+    except Exception as exc:
+        logger.warning(f"Error evaluating auth form discovery: {exc}")
+        return {"inputs": [], "buttons": [], "body_text": ""}
 
 
 def _detect_challenge_text(page_text: str, url: str) -> bool:
@@ -1002,7 +1054,8 @@ def _detect_challenge_text(page_text: str, url: str) -> bool:
         "verify you are human",
         "checking your browser",
         "security check",
-        "challenge",
+        "bot challenge",
+        "security challenge",
         "cf-challenge",
     )
     url_text = _normalize_text(url)
@@ -1075,15 +1128,74 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                 log_callback(f"[Orchestrator] Bot/challenge screen detected at {page.url}. Waiting for manual verification or a human-assisted step.")
             return False
 
+        # Check if login input fields (username and password) are visible in the DOM
+        visible_username_inputs = False
+        visible_password_inputs = False
+        for inp in snapshot.get("inputs", []):
+            if inp.get("visible"):
+                role = inp.get("role")
+                if role in {"mobile", "email", "username"}:
+                    visible_username_inputs = True
+                elif role == "password":
+                    visible_password_inputs = True
+
+        need_login_trigger = not visible_username_inputs or (password and not visible_password_inputs)
+
+        # If they are not visible, look for trigger buttons/links and click them to open the modal
+        if need_login_trigger:
+            if log_callback:
+                log_callback("[Orchestrator] Login form inputs not fully visible on page load. Attempting to click LOGIN trigger links/buttons.")
+            trigger_selectors = [
+                "a:has-text('LOGIN')",
+                "a:has-text('Login')",
+                "a:has-text('Sign in')",
+                "a:has-text('Sign In')",
+                "button:has-text('LOGIN')",
+                "button:has-text('Login')",
+                "button:has-text('Sign in')",
+                "button:has-text('Sign In')",
+                ".login_popup_register",
+            ]
+            clicked_trigger = False
+            for selector in trigger_selectors:
+                loc = page.locator(selector)
+                if loc.count() > 0:
+                    try:
+                        for j in range(loc.count()):
+                            trigger = loc.nth(j)
+                            if trigger.is_visible():
+                                trigger.click()
+                                clicked_trigger = True
+                                break
+                        if clicked_trigger:
+                            break
+                    except Exception as e:
+                        if log_callback:
+                            log_callback(f"[Orchestrator] Failed clicking login trigger '{selector}': {e}")
+            if clicked_trigger:
+                page.wait_for_timeout(2000)  # Wait for modal transit animation
+                snapshot = _discover_auth_form(page)
+
         def fill_first(selectors, value):
             for selector in selectors:
                 loc = page.locator(selector)
-                if loc.count() > 0:
+                count = loc.count()
+                # Prioritize visible elements
+                for j in range(count):
+                    el = loc.nth(j)
+                    if el.is_visible():
+                        try:
+                            el.fill(value)
+                            return True
+                        except Exception:
+                            pass
+                # Fallback to normal first match
+                if count > 0:
                     try:
                         loc.first.fill(value)
                         return True
                     except Exception:
-                        continue
+                        pass
             return False
 
         field_values = {
@@ -1134,7 +1246,6 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
         field_roles = [field.get("role") for field in snapshot.get("inputs", [])]
 
         if log_callback:
-            # Debug: what auth form inputs the detector saw
             try:
                 inputs_debug = [
                     {
@@ -1181,15 +1292,33 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
             "text=Sign in",
         ]
         submitted = False
+        # Prioritize clicking visible submit buttons
         for selector in submit_selectors:
             try:
                 loc = page.locator(selector)
-                if loc.count() > 0:
-                    loc.first.click()
-                    submitted = True
+                count = loc.count()
+                for j in range(count):
+                    btn = loc.nth(j)
+                    if btn.is_visible():
+                        btn.click()
+                        submitted = True
+                        break
+                if submitted:
                     break
             except Exception:
                 continue
+
+        # Fallback to normal click if no visible submit buttons clicked
+        if not submitted:
+            for selector in submit_selectors:
+                try:
+                    loc = page.locator(selector)
+                    if loc.count() > 0:
+                        loc.first.click()
+                        submitted = True
+                        break
+                except Exception:
+                    continue
 
         if submitted:
             try:
@@ -1229,7 +1358,7 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                 log_callback(f"[Orchestrator] Bot/challenge screen detected after submit at {page.url}. Manual verification is required.")
             return False
 
-        input_roles = [field.get("role") for field in snapshot.get("inputs", [])]
+        input_roles = [field.get("role") for field in snapshot.get("inputs", []) if field.get("visible")]
         if log_callback:
             try:
                 log_callback(f"[Orchestrator][AuthDebug] Post-submit detected input roles: {sorted(set(input_roles))}")
@@ -1277,7 +1406,7 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
                 log_callback(f"[Orchestrator] Bot/challenge screen detected after submit at {page.url}. Manual verification is required.")
             return False
 
-        input_roles = [field.get("role") for field in snapshot.get("inputs", [])]
+        input_roles = [field.get("role") for field in snapshot.get("inputs", []) if field.get("visible")]
         # If OTP is present and we didn't provide it, we must pause.
         if "otp" in input_roles and not otp_code:
             issue = {
