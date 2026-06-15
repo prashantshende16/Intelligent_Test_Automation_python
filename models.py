@@ -13,6 +13,7 @@ class Task(Base):
     id = Column(String, primary_key=True, default=generate_uuid)
     url = Column(String, nullable=False)
     status = Column(String, default="pending") # pending, crawling, generating_test_cases, running_tests, completed, failed
+    is_mobile = Column(Integer, default=0) # 0 = desktop, 1 = mobile
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 

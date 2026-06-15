@@ -8,6 +8,7 @@ class TaskBase(BaseModel):
 class TaskCreate(TaskBase):
     codebase_path: Optional[str] = None
     seed_urls: Optional[List[str]] = None
+    is_mobile: Optional[bool] = False
     auth_required: Optional[bool] = False
     auth_login_url: Optional[str] = None
     auth_post_login_url: Optional[str] = None
@@ -32,11 +33,13 @@ class TaskInputUpdate(BaseModel):
     auth_required_fields: Optional[str] = None
     form_values_json: Optional[str] = None
     seed_urls: Optional[List[str]] = None
+    is_mobile: Optional[bool] = None
 
 class TaskResponse(BaseModel):
     id: str
     url: str
     status: str
+    is_mobile: Optional[bool] = False
     created_at: datetime
     completed_at: Optional[datetime] = None
     

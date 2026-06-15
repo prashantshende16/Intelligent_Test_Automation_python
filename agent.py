@@ -565,7 +565,7 @@ def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 12)
     return deduped
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = None, seed_urls: list = None) -> list:
+def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = None, seed_urls: list = None, is_mobile: bool = False) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
@@ -576,13 +576,22 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
             queue.append(normalized_seed)
 
     try:
-        logger.info(f"Starting Playwright crawl for {normalized}")
+        logger.info(f"Starting Playwright crawl for {normalized} (is_mobile={is_mobile})")
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
-            context = browser.new_context(
-                ignore_https_errors=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
+            if is_mobile:
+                context = browser.new_context(
+                    viewport={"width": 375, "height": 667},
+                    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
+                    is_mobile=True,
+                    has_touch=True,
+                    ignore_https_errors=True
+                )
+            else:
+                context = browser.new_context(
+                    ignore_https_errors=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                )
             if auth and auth.get("auth_required"):
                 authenticate_browser_context(context, auth, normalized, logger.info)
             page = context.new_page()
@@ -595,6 +604,16 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
                     except Exception:
                         pass
                     expand_navigation_regions(page)
+                except Exception:
+                    pass
+            else:
+                try:
+                    page.goto(normalized, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=5000)
+                    except Exception:
+                        pass
+                    check_and_click_guest_bypass(page, logger.info)
                 except Exception:
                     pass
 
@@ -615,6 +634,11 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
                     logger.warning(f"Timeout loading {current_url}: {exc}")
                 except Exception as exc:
                     logger.warning(f"Failed to navigate to {current_url}: {exc}")
+
+                actual_url = page.url
+                if actual_url != current_url and same_site(actual_url, normalized):
+                    visited.add(actual_url)
+                    current_url = actual_url
 
                 status_code = response.status if response else 500
                 try:
@@ -712,6 +736,103 @@ def crawl_website(url: str) -> dict:
         data["images"] = []
 
     return data
+
+
+def extract_codebase_page_info(codebase_path: str, codebase_data: dict) -> dict:
+    """
+    Statically analyzes page files in the React codebase to extract form fields,
+    validation rules, expected success responses, API calls, and error messages.
+    """
+    from urllib.parse import urlparse
+    page_info = {}
+    
+    file_list = codebase_data.get("file_list", [])
+    for rel_path in file_list:
+        # Check files under src/pages
+        if not (rel_path.replace("\\", "/").startswith("src/pages/") and rel_path.endswith((".jsx", ".tsx"))):
+            continue
+            
+        filename = os.path.basename(rel_path)
+        page_name = os.path.splitext(filename)[0]
+        
+        # Exclude router / layouts / guards
+        if page_name in ["AnimatedRoutes", "RedirectGuard", "Layout", "PreLoginLayout", "ProtectedRoute", "AccessDeniedPage"]:
+            continue
+            
+        full_path = os.path.join(codebase_path, rel_path)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+                
+            # 1. Parse input names
+            inputs = []
+            input_matches = re.findall(r'(?:name|id)\s*=\s*["\']([^"\']+)["\']', content)
+            custom_input_matches = re.findall(r'<(?:TextInput|CheckboxInput|SelectInput|RadioInput|DatePickerInput|DatePicker)\s+[^>]*name\s*=\s*["\']([^"\']+)["\']', content)
+            
+            seen_inputs = set()
+            for inp in input_matches + custom_input_matches:
+                inp_lower = inp.lower()
+                if inp_lower in seen_inputs or any(x in inp_lower for x in ["class", "style", "key", "route", "btn", "button", "active", "click", "auth"]):
+                    continue
+                seen_inputs.add(inp_lower)
+                inputs.append(inp)
+                
+            # 2. Parse validation errors
+            errors = []
+            error_matches = re.findall(r'(?:setError|toast\.error|toast\.success|alert|showMessage)\s*\(\s*["\']([^"\']+)["\']', content)
+            for err in error_matches:
+                if len(err) > 5 and len(err) < 120 and err not in errors:
+                    errors.append(err)
+                    
+            # 3. Parse API calls
+            api_calls = []
+            api_matches = re.findall(r'(?:apiService\.(?:post|get|put|delete)|ENDPOINTS\.[A-Z0-9_]+)', content)
+            for api in api_matches:
+                if api not in api_calls:
+                    api_calls.append(api)
+                    
+            # 4. Success outcomes / Redirects
+            redirects = []
+            nav_matches = re.findall(r'navigate\s*\(\s*["\']([^"\']+)["\']', content)
+            for nav in nav_matches:
+                if nav not in redirects:
+                    redirects.append(nav)
+                    
+            if inputs or errors or api_calls or redirects:
+                page_info[page_name] = {
+                    "rel_path": rel_path,
+                    "inputs": inputs,
+                    "errors": errors[:6],
+                    "api_calls": api_calls[:4],
+                    "redirects": redirects[:3]
+                }
+        except Exception as e:
+            logger.warning(f"Failed to statically parse {rel_path}: {e}")
+            
+    return page_info
+
+
+def match_url_to_component(page_url: str, codebase_page_info: dict) -> str:
+    from urllib.parse import urlparse
+    path = urlparse(page_url).path.strip("/")
+    if not path:
+        if "Login" in codebase_page_info:
+            return "Login"
+        return ""
+        
+    normalized_path = path.replace("-", "").replace("_", "").lower()
+    
+    # Try exact match
+    for comp_name in codebase_page_info:
+        if comp_name.lower() == normalized_path:
+            return comp_name
+            
+    # Try partial match
+    for comp_name in codebase_page_info:
+        if normalized_path in comp_name.lower():
+            return comp_name
+            
+    return ""
 
 
 def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
@@ -848,6 +969,46 @@ def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
             "description": f"Validate the actual page '{page_title}' at {page_profile['page_url']}.",
             "test_cases": page_specific_cases,
         })
+
+    codebase_path = codebase_data.get("codebase_path")
+    if codebase_path and os.path.isdir(codebase_path):
+        codebase_page_info = extract_codebase_page_info(codebase_path, codebase_data)
+        for page in pages or []:
+            page_profile = build_page_profile(page, page_url)
+            comp_name = match_url_to_component(page_profile["page_url"], codebase_page_info)
+            if comp_name:
+                info = codebase_page_info[comp_name]
+                test_cases_list = [
+                    pending_test(
+                        f"Code Review — {comp_name} Input Validations",
+                        f"1. Open page: {page_profile['page_url']}\n2. Verify the following inputs from code are active: {', '.join(info['inputs']) if info['inputs'] else 'none'}\n3. Trigger client validations to verify error outputs",
+                        "Expected form inputs should render correctly and throw appropriate user/validation errors.",
+                        "code_validation",
+                        page_profile["page_url"]
+                    ),
+                    pending_test(
+                        f"Code Review — {comp_name} Expected Outputs & API calls",
+                        f"1. Analyze submit flow on {comp_name}\n2. Submit data and check for API calls: {', '.join(info['api_calls']) if info['api_calls'] else 'default submission'}\n3. Verify redirect to: {', '.join(info['redirects']) if info['redirects'] else 'same page'}",
+                        "Form submit should execute the expected API calls and redirect as defined in the source code.",
+                        "code_redirect",
+                        page_profile["page_url"]
+                    )
+                ]
+                if info["errors"]:
+                    test_cases_list.append(
+                        pending_test(
+                            f"Code Review — {comp_name} Expected Errors",
+                            f"1. Fuzz inputs on {page_profile['page_url']}\n2. Try to trigger the following expected error cases defined in code:\n" + "\n".join([f"   - {err}" for err in info["errors"]]),
+                            "The page should display the correct error messages corresponding to validation rules defined in the code.",
+                            "code_errors",
+                            page_profile["page_url"]
+                        )
+                    )
+                use_cases.append({
+                    "title": f"Code Audit & Logic Flow — {comp_name} ({info['rel_path']})",
+                    "description": f"Verify logic flows, validation errors, and expected outputs extracted from codebase page {comp_name}.",
+                    "test_cases": test_cases_list
+                })
 
     if profile["meta_count"] < 3:
         suggestions.append({
@@ -1102,6 +1263,46 @@ def _classify_auth_flow(required_fields: list) -> str:
     if "challenge" in fields:
         return "challenge"
     return "general"
+
+
+def check_and_click_guest_bypass(page, log_callback=None) -> bool:
+    """Check if the page has a guest bypass option (e.g., 'Continue without logging in') and click it."""
+    try:
+        bypass_selectors = [
+            "text='Continue without logging in' i",
+            "text='Continue as Guest' i",
+            "text='Guest Login' i",
+            "text='Skip Login' i",
+            "text='Continue as guest' i",
+            "a:has-text('Continue without logging in')",
+            "a:has-text('Continue as Guest')",
+            "button:has-text('Continue without logging in')",
+            "button:has-text('Continue as Guest')",
+        ]
+        for selector in bypass_selectors:
+            loc = page.locator(selector)
+            if loc.count() > 0:
+                for j in range(loc.count()):
+                    btn = loc.nth(j)
+                    # Relax strict visibility checks to support elements hidden on desktop layouts
+                    if btn.is_visible() or btn.count() > 0:
+                        if log_callback:
+                            log_callback(f"[GuestBypass] Found guest bypass link/button: '{selector}'. Clicking it to access protected areas.")
+                        try:
+                            btn.click(force=True, timeout=3000)
+                        except Exception:
+                            # Fallback to JavaScript click in case of Playwright actionability issues
+                            btn.evaluate("el => el.click()")
+                        page.wait_for_timeout(2000)  # Wait for transition/redirect
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                        return True
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[GuestBypass] Error clicking guest bypass: {e}")
+    return False
 
 
 def authenticate_browser_context(context, auth: dict, start_url: str, log_callback=None) -> bool:
@@ -1683,16 +1884,50 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
         for page in pages or []
     }
 
+    # Fetch is_mobile setting from task in DB
+    db_sess = SessionLocal()
+    try:
+        task_record = db_sess.query(Task).filter(Task.id == task_id).first()
+        is_mobile = bool(task_record.is_mobile) if (task_record and getattr(task_record, "is_mobile", None) is not None) else False
+    except Exception:
+        is_mobile = False
+    finally:
+        db_sess.close()
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(
-            ignore_https_errors=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        )
+        if is_mobile:
+            context = browser.new_context(
+                viewport={"width": 375, "height": 667},
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
+                is_mobile=True,
+                has_touch=True,
+                ignore_https_errors=True
+            )
+        else:
+            context = browser.new_context(
+                ignore_https_errors=True,
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            )
         if auth and auth.get("auth_required"):
             authenticate_browser_context(context, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info)
         page = context.new_page()
         page.set_default_timeout(20000)
+
+        # Check for guest bypass option if no auth is required
+        if not (auth and auth.get("auth_required")) and base_url:
+            try:
+                if log_callback:
+                    log_callback(f"[GuestBypass] Initializing guest bypass session by visiting {base_url}")
+                page.goto(base_url, wait_until="domcontentloaded")
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                check_and_click_guest_bypass(page, log_callback)
+            except Exception as e:
+                if log_callback:
+                    log_callback(f"[GuestBypass] Warning: Failed guest bypass initialization: {e}")
 
         for use_case_id, test_cases in use_case_mapping.items():
             for test_data in test_cases:
@@ -2460,6 +2695,7 @@ def run_testing_agent(task_id: str):
         key_files_context = ""
         if codebase:
             codebase_data = scan_codebase(codebase.local_path)
+            codebase_data["codebase_path"] = codebase.local_path
             codebase.framework_type = codebase_data["framework_type"]
             codebase.file_tree = json.dumps(codebase_data["file_tree"])
             codebase.analyzed_at = datetime.utcnow()
@@ -2520,7 +2756,18 @@ def run_testing_agent(task_id: str):
         if seed_urls:
             write_orchestrator_log(f"[Orchestrator] Seeded pages: {', '.join(seed_urls)}")
 
-        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls)
+        is_mobile = bool(task.is_mobile) if getattr(task, "is_mobile", None) is not None else False
+        # Auto-detect if mobile emulation is required for local React webview projects
+        if not is_mobile and (
+            "192.168.10.125:3000" in getattr(task, "url", "")
+            or (codebase and "ahoa" in codebase.local_path.lower())
+        ):
+            is_mobile = True
+            task.is_mobile = 1
+            db.commit()
+            write_orchestrator_log("[Orchestrator] Auto-detected React mobile webview codebase. Enabling Mobile Viewport Emulation automatically.")
+
+        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls, is_mobile=is_mobile)
         auth_issue = (auth_data or {}).get("_codex_auth_issue")
         if auth_issue:
             if auth:

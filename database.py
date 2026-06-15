@@ -37,6 +37,19 @@ except Exception:
         connect_args={"check_same_thread": False}
     )
 
+from sqlalchemy.event import listen
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA temp_store = MEMORY")
+        cursor.execute("PRAGMA journal_mode = WAL")
+    except Exception:
+        pass
+    finally:
+        cursor.close()
+
+listen(engine, 'connect', set_sqlite_pragma)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()

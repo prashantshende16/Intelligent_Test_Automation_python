@@ -38,6 +38,17 @@ def ensure_task_auth_columns():
 
 ensure_task_auth_columns()
 
+def ensure_task_mobile_column():
+    inspector = inspect(engine)
+    if "tasks" not in inspector.get_table_names():
+        return
+    columns = {col["name"] for col in inspector.get_columns("tasks")}
+    if "is_mobile" not in columns:
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE tasks ADD COLUMN is_mobile INTEGER DEFAULT 0"))
+
+ensure_task_mobile_column()
+
 app = FastAPI(title="AI Website Testing Automation API")
 
 # Enable CORS for frontend app
@@ -68,6 +79,7 @@ def get_task_with_counts(task: models.Task, db: Session) -> schemas.TaskResponse
         id=task.id,
         url=task.url,
         status=task.status,
+        is_mobile=bool(task.is_mobile),
         created_at=task.created_at,
         completed_at=task.completed_at,
         use_case_count=use_case_count,
@@ -92,7 +104,8 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
     # Create Task record
     db_task = models.Task(
         url=task_in.url,
-        status="pending"
+        status="pending",
+        is_mobile=1 if task_in.is_mobile else 0
     )
     db.add(db_task)
     db.commit()
@@ -199,6 +212,9 @@ def update_task_input(task_id: str, task_input: schemas.TaskInputUpdate, db: Ses
             db.add(seed_record)
         else:
             seed_record.seed_urls_json = json.dumps(seed_urls)
+
+    if task_input.is_mobile is not None:
+        task.is_mobile = 1 if task_input.is_mobile else 0
 
     task.status = "pending"
     task.completed_at = None
