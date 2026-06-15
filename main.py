@@ -340,46 +340,46 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
 
     def section(title: str):
         writer.writerow([])
-        writer.writerow([title])
-
-    def kv_rows(pairs):
-        for key, value in pairs:
-            writer.writerow([key, value])
+        writer.writerow([title.upper()])
 
     section("Task Summary")
-    kv_rows([
-        ("Task ID", task.id),
-        ("URL", task.url),
-        ("Status", task.status),
-        ("Created At", task.created_at.isoformat()),
-        ("Completed At", task.completed_at.isoformat() if task.completed_at else ""),
-        ("Test Cases", len(test_cases)),
-        ("Errors", len(errors)),
-        ("Suggestions", len(suggestions)),
+    writer.writerow(["TASK ID", "URL", "STATUS", "CREATED AT", "COMPLETED AT", "TEST CASES", "ERRORS", "SUGGESTIONS"])
+    writer.writerow([
+        task.id,
+        task.url,
+        task.status,
+        task.created_at.isoformat(),
+        task.completed_at.isoformat() if task.completed_at else "",
+        len(test_cases),
+        len(errors),
+        len(suggestions)
     ])
 
     section("Codebase")
+    writer.writerow(["PATH", "FRAMEWORK", "ANALYZED AT"])
     if codebase:
-        kv_rows([
-            ("Path", codebase.local_path),
-            ("Framework", codebase.framework_type),
-            ("Analyzed At", codebase.analyzed_at.isoformat() if codebase.analyzed_at else ""),
+        writer.writerow([
+            codebase.local_path,
+            codebase.framework_type,
+            codebase.analyzed_at.isoformat() if codebase.analyzed_at else ""
         ])
     else:
-        writer.writerow(["Not provided"])
+        writer.writerow(["Not provided", "", ""])
 
     section("Authentication")
+    writer.writerow(["AUTH REQUIRED", "LOGIN URL", "USERNAME", "OTP HINT"])
     if auth:
-        kv_rows([
-            ("Auth Required", str(bool(auth.auth_required))),
-            ("Login URL", auth.auth_login_url or ""),
-            ("Username", auth.auth_username or ""),
-            ("OTP Hint", auth.auth_otp_hint or ""),
+        writer.writerow([
+            str(bool(auth.auth_required)),
+            auth.auth_login_url or "",
+            auth.auth_username or "",
+            auth.auth_otp_hint or ""
         ])
     else:
-        writer.writerow(["Not provided"])
+        writer.writerow(["Not provided", "", "", ""])
 
     section("Seed URLs")
+    writer.writerow(["SEED URL"])
     if seeds and seeds.seed_urls_json:
         try:
             seed_list = json.loads(seeds.seed_urls_json)
@@ -391,7 +391,7 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
         writer.writerow(["Not provided"])
 
     section("Use Cases")
-    writer.writerow(["Use Case Title", "Page URL", "Description", "Created At", "Use Case ID"])
+    writer.writerow(["USE CASE TITLE", "PAGE URL", "DESCRIPTION", "CREATED AT", "USE CASE ID"])
     test_case_page_urls = {}
     for err in errors:
         if err.test_case_id and err.page_url:
@@ -413,7 +413,7 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
         writer.writerow([uc.title, use_case_page_urls.get(uc.id, ""), uc.description or "", uc.created_at.isoformat(), uc.id])
 
     section("Test Cases")
-    writer.writerow(["Title", "Status", "Page URL", "Expected Result", "Error Message", "Steps", "Execution Time", "Created At", "Use Case ID"])
+    writer.writerow(["TITLE", "STATUS", "PAGE URL", "EXPECTED RESULT", "ERROR MESSAGE", "STEPS", "EXECUTION TIME", "CREATED AT", "USE CASE ID"])
     for tc in test_cases:
         writer.writerow([
             tc.title,
@@ -428,7 +428,7 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
         ])
 
     section("Errors")
-    writer.writerow(["Message", "Severity", "Page URL", "Screenshot", "Created At", "Test Case ID"])
+    writer.writerow(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "CREATED AT", "TEST CASE ID"])
     for err in errors:
         writer.writerow([
             err.message,
@@ -440,12 +440,12 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
         ])
 
     section("Suggestions")
-    writer.writerow(["Title", "Priority", "Description", "Created At"])
+    writer.writerow(["TITLE", "PRIORITY", "DESCRIPTION", "CREATED AT"])
     for sug in suggestions:
         writer.writerow([sug.title, sug.priority, sug.description or "", sug.created_at.isoformat()])
 
     section("Agent States")
-    writer.writerow(["Agent", "Status", "Warnings", "Started At", "Completed At", "Log Output"])
+    writer.writerow(["AGENT", "STATUS", "WARNINGS", "STARTED AT", "COMPLETED AT", "LOG OUTPUT"])
     for agent in agent_states:
         writer.writerow([
             agent.agent_name,
