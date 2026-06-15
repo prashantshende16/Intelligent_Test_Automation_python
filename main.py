@@ -1,4 +1,5 @@
 import threading
+from datetime import datetime
 import os
 import json
 import csv
@@ -231,6 +232,25 @@ def resume_task(task_id: str, db: Session = Depends(get_db)):
     task.completed_at = None
     db.commit()
     start_task_thread(task_id)
+    return get_task_with_counts(task, db)
+
+@app.post("/api/tasks/{task_id}/stop", response_model=schemas.TaskResponse)
+def stop_task(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    task.status = "stopped"
+    task.completed_at = datetime.utcnow()
+    
+    # Update running agent states to failed/stopped
+    agent_states = db.query(models.AgentState).filter(models.AgentState.task_id == task_id).all()
+    for state in agent_states:
+        if state.status in {"pending", "running"}:
+            state.status = "failed"
+            state.completed_at = datetime.utcnow()
+            
+    db.commit()
+    db.refresh(task)
     return get_task_with_counts(task, db)
 
 @app.get("/api/tasks", response_model=List[schemas.TaskResponse])

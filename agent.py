@@ -565,7 +565,7 @@ def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 12)
     return deduped
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = None, seed_urls: list = None, is_mobile: bool = False) -> list:
+def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
@@ -618,6 +618,9 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
                     pass
 
             while queue and len(snapshots) < max_pages:
+                if cancel_check and cancel_check():
+                    logger.info("[Crawler] Cancellation requested. Stopping page discovery.")
+                    break
                 current_url = queue.pop(0)
                 if current_url in visited:
                     continue
@@ -1931,6 +1934,18 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
 
         for use_case_id, test_cases in use_case_mapping.items():
             for test_data in test_cases:
+                # Check cancellation status
+                try:
+                    db_check = SessionLocal()
+                    task_status = db_check.query(Task.status).filter(Task.id == task_id).scalar()
+                    db_check.close()
+                    if task_status == "stopped":
+                        if log_callback:
+                            log_callback("[Orchestrator] Test execution cancelled by the user. Stopping validation loop.")
+                        return error_ids
+                except Exception:
+                    pass
+
                 page_url = normalize_url(test_data.get("page_url", base_url))
                 test_profile = page_profiles.get(page_url, profile)
                 if log_callback:
@@ -2667,6 +2682,17 @@ def run_testing_agent(task_id: str):
             logger.error(f"Task {task_id} not found in database.")
             return
 
+        def is_cancelled() -> bool:
+            try:
+                db.expire(task)
+                current_status = db.query(Task.status).filter(Task.id == task_id).scalar()
+                return current_status == "stopped"
+            except Exception:
+                return False
+
+        if is_cancelled():
+            return
+
         task.status = "crawling"
         db.commit()
 
@@ -2767,7 +2793,9 @@ def run_testing_agent(task_id: str):
             db.commit()
             write_orchestrator_log("[Orchestrator] Auto-detected React mobile webview codebase. Enabling Mobile Viewport Emulation automatically.")
 
-        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls, is_mobile=is_mobile)
+        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls, is_mobile=is_mobile, cancel_check=is_cancelled)
+        if is_cancelled():
+            return
         auth_issue = (auth_data or {}).get("_codex_auth_issue")
         if auth_issue:
             if auth:
@@ -2794,6 +2822,8 @@ def run_testing_agent(task_id: str):
         write_orchestrator_log(f"[Orchestrator] Discovered pages: {', '.join(discovered_urls) if discovered_urls else 'none'}")
         write_orchestrator_log(f"[Orchestrator] Discovered {len(page_snapshots)} page snapshots.")
 
+        if is_cancelled():
+            return
         task.status = "generating_test_cases"
         db.commit()
         write_orchestrator_log("[Orchestrator] Stage: generating_test_cases")
@@ -2848,6 +2878,8 @@ def run_testing_agent(task_id: str):
         db.commit()
         write_orchestrator_log(f"[Orchestrator] Persisted {len(analysis.get('suggestions', []))} suggestion record(s).")
 
+        if is_cancelled():
+            return
         task.status = "running_tests"
         db.commit()
         write_orchestrator_log("[Orchestrator] Stage: running_tests")
@@ -2911,7 +2943,7 @@ def run_testing_agent(task_id: str):
         logger.error(f"Error executing AI testing agent: {exc}")
         logger.error(traceback.format_exc())
         task = db.query(Task).filter(Task.id == task_id).first()
-        if task:
+        if task and task.status != "stopped":
             task.status = "failed"
             task.completed_at = datetime.utcnow()
         orchestrator_state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Orchestrator").first()
