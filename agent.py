@@ -1965,7 +1965,8 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                         expected_result=test_data.get("expected_result"),
                         status=actual_status,
                         error_message=actual_error,
-                        execution_time=round(0.5 + float(time.time() % 1), 2)
+                        execution_time=round(0.5 + float(time.time() % 1), 2),
+                        page_url=page_url
                     )
                     db.add(test_case)
                     db.commit()
@@ -2289,7 +2290,111 @@ def generate_mock_analysis(url: str, crawl_data: dict, codebase_data: dict) -> d
     return {"use_cases": use_cases, "suggestions": suggestions}
 
 
-def generate_gemini_analysis(url: str, crawl_data: dict, codebase_data: dict, key_files_context: str, api_key: str) -> dict:
+def generate_openai_analysis(url: str, crawl_data: dict, codebase_data: dict, key_files_context: str, api_key: str, user_prompt: str = None) -> dict:
+    logger.info("Using OpenAI API for codebase-aware test suite generation")
+    prompt = f"""
+You are an expert QA Automation Engineer and Code Auditor. Analyze the crawled DOM structure of the website under test and its accompanying codebase files to generate structured testing suites.
+
+Website URL: {url}
+Domain: {crawl_data.get('domain', url)}
+Crawled Metadata:
+- Page Title: {crawl_data.get('title')}
+- HTTP Status: {crawl_data.get('status_code', 200)}
+- HTML Size: {crawl_data.get('html_length', 0)} bytes
+- Pages Crawled: {crawl_data.get('page_count', 1)}
+- Headings: {json.dumps(crawl_data.get('headings'))}
+- Forms Discovered: {json.dumps(crawl_data.get('forms'))}
+- Discovered Links: {json.dumps(crawl_data.get('links'))}
+
+Codebase Context:
+- Framework: {codebase_data.get('framework_type')}
+- Key files structure & Content: {key_files_context}
+- Total files: {len(codebase_data.get('file_list', []))}
+"""
+    if user_prompt:
+        prompt += f"\nADDITIONAL USER TESTING DIRECTIVE:\nFollow these instructions when designing the test cases:\n{user_prompt}\n"
+
+    prompt += """
+Generate exactly 3 Use Cases tailored to THIS specific website (use the domain, page title, actual link texts, and form field names in titles).
+Each Use Case should contain 2 specific Test Cases referencing real elements found in the crawl data.
+Set every test case status to "pending" — pass/fail will be determined by live browser execution.
+Include a "check_type" for each test case: one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages.
+Generate 2-4 suggestions that reference specific findings from THIS site's crawl data (not generic advice).
+
+Your response MUST be valid JSON matching this schema:
+{
+  "use_cases": [
+    {
+      "title": "Use Case Title",
+      "description": "Description",
+      "test_cases": [
+        {
+          "title": "Test Case Title",
+          "steps": "Step 1: ...\\nStep 2: ...",
+          "expected_result": "Expected result details",
+          "status": "pending",
+          "error_message": null,
+          "severity": null,
+          "page_url": "URL of page under test",
+          "check_type": "one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages"
+        }
+      ]
+    }
+  ],
+  "suggestions": [
+    {
+      "title": "Suggestion summary",
+      "description": "Details",
+      "priority": "low, medium, or high"
+    }
+  ]
+}
+Return ONLY raw JSON. No markdown code blocks.
+"""
+    try:
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"}
+        }
+
+        response = httpx.post(
+            endpoint, 
+            json=payload, 
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}"
+            }, 
+            timeout=30.0
+        )
+        if response.status_code != 200:
+            logger.error(f"OpenAI API returned error: {response.text}")
+            raise Exception(f"OpenAI API Error: {response.text}")
+
+        result_json = response.json()
+        choices = result_json.get("choices", [])
+        if not choices:
+            raise ValueError(f"OpenAI returned no choices: {result_json}")
+
+        text_content = choices[0].get("message", {}).get("content", "").strip()
+        if not text_content:
+            raise ValueError(f"OpenAI returned empty text content: {result_json}")
+
+        parsed = json.loads(text_content)
+        if not isinstance(parsed, dict):
+            raise ValueError("OpenAI response was not a JSON object.")
+        parsed.setdefault("use_cases", [])
+        parsed.setdefault("suggestions", [])
+        return parsed
+    except Exception as exc:
+        logger.error(f"Failed to generate analysis using OpenAI: {exc}")
+        logger.error(traceback.format_exc())
+        return {"use_cases": [], "suggestions": []}
+
+
+def generate_gemini_analysis(url: str, crawl_data: dict, codebase_data: dict, key_files_context: str, api_key: str, user_prompt: str = None) -> dict:
     logger.info("Using Gemini API for codebase-aware test suite generation")
     prompt = f"""
 You are an expert QA Automation Engineer and Code Auditor. Analyze the crawled DOM structure of the website under test and its accompanying codebase files to generate structured testing suites.
@@ -2309,7 +2414,11 @@ Codebase Context:
 - Framework: {codebase_data.get('framework_type')}
 - Key files structure & Content: {key_files_context}
 - Total files: {len(codebase_data.get('file_list', []))}
+"""
+    if user_prompt:
+        prompt += f"\nADDITIONAL USER TESTING DIRECTIVE:\nFollow these instructions when designing the test cases:\n{user_prompt}\n"
 
+    prompt += """
 Generate exactly 3 Use Cases tailored to THIS specific website (use the domain, page title, actual link texts, and form field names in titles).
 Each Use Case should contain 2 specific Test Cases referencing real elements found in the crawl data.
 Set every test case status to "pending" — pass/fail will be determined by live browser execution.
@@ -2829,41 +2938,126 @@ def run_testing_agent(task_id: str):
         write_orchestrator_log("[Orchestrator] Stage: generating_test_cases")
         time.sleep(1.5)
 
-        api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        ai_model = getattr(task, "ai_model", "gemini-1.5-flash") or "gemini-1.5-flash"
+        user_prompt = getattr(task, "user_prompt", None)
+        
+        openai_key = os.getenv("OPENAI_API_KEY")
+        gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        
         analysis = {"use_cases": [], "suggestions": []}
-        if api_key:
-            site_profile = aggregate_site_profile(task.url, page_snapshots)
-            crawl_data_for_ai = {
-                "title": site_profile.get("primary_title", "Unknown Page"),
-                "domain": site_profile.get("domain", normalize_url(task.url).split("//", 1)[1].split("/")[0]),
-                "headings": site_profile.get("headings", []),
-                "forms": site_profile.get("forms", []),
-                "links": (site_profile.get("links", []) or [])[:20],
-                "meta_tags": site_profile.get("meta_tags", {}),
-                "html_length": site_profile.get("html_length", 0),
-                "page_count": site_profile.get("page_count", len(page_snapshots)),
-                "status_code": site_profile.get("status_code", 200),
-            }
-            analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, api_key)
-            source = "Gemini API" if analysis.get("use_cases") else "local fallback"
-            write_orchestrator_log(f"[Orchestrator] Test planning source: {source}")
+        selected_service = "local fallback"
+        
+        site_profile = aggregate_site_profile(task.url, page_snapshots)
+        crawl_data_for_ai = {
+            "title": site_profile.get("primary_title", "Unknown Page"),
+            "domain": site_profile.get("domain", normalize_url(task.url).split("//", 1)[1].split("/")[0]),
+            "headings": site_profile.get("headings", []),
+            "forms": site_profile.get("forms", []),
+            "links": (site_profile.get("links", []) or [])[:20],
+            "meta_tags": site_profile.get("meta_tags", {}),
+            "html_length": site_profile.get("html_length", 0),
+            "page_count": site_profile.get("page_count", len(page_snapshots)),
+            "status_code": site_profile.get("status_code", 200),
+        }
+        
+        # Model Selection Routing
+        is_openai_model = any(m in ai_model.lower() for m in ["openai", "gpt", "chatgpt"])
+        is_gemini_model = any(m in ai_model.lower() for m in ["gemini", "google"])
+        
+        if ai_model == "auto":
+            if openai_key:
+                analysis = generate_openai_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, openai_key, user_prompt)
+                selected_service = "OpenAI API (gpt-4o via Auto)"
+            elif gemini_key:
+                analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, gemini_key, user_prompt)
+                selected_service = "Gemini API (gemini-1.5-flash via Auto)"
+        elif is_openai_model:
+            if openai_key:
+                analysis = generate_openai_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, openai_key, user_prompt)
+                selected_service = f"OpenAI API ({ai_model})"
+            else:
+                write_orchestrator_log(f"[Orchestrator] Requested model '{ai_model}' but OPENAI_API_KEY is not set.")
+        elif is_gemini_model:
+            if gemini_key:
+                analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, gemini_key, user_prompt)
+                selected_service = f"Gemini API ({ai_model})"
+            else:
+                write_orchestrator_log(f"[Orchestrator] Requested model '{ai_model}' but GEMINI_API_KEY is not set.")
+                
+        if not analysis.get("use_cases"):
+            # Secondary fallback routing if preferred service failed or key was missing
+            if gemini_key and not is_gemini_model:
+                write_orchestrator_log("[Orchestrator] Attempting fallback to Gemini API.")
+                analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, gemini_key, user_prompt)
+                if analysis.get("use_cases"):
+                    selected_service = "Gemini API (Fallback)"
+            elif openai_key and not is_openai_model:
+                write_orchestrator_log("[Orchestrator] Attempting fallback to OpenAI API.")
+                analysis = generate_openai_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, openai_key, user_prompt)
+                if analysis.get("use_cases"):
+                    selected_service = "OpenAI API (Fallback)"
 
         if not analysis.get("use_cases"):
             analysis = build_test_plan(task.url, page_snapshots, codebase_data)
+            selected_service = "local fallback planner"
             write_orchestrator_log("[Orchestrator] Local fallback planner produced the test suite.")
+        else:
+            write_orchestrator_log(f"[Orchestrator] Test planning source: {selected_service}")
 
         write_orchestrator_log(
             f"[Orchestrator] Planned {len(analysis.get('use_cases', []))} use case(s) and {len(analysis.get('suggestions', []))} suggestion(s)."
         )
 
+        # Parse and save custom use cases from task.custom_use_cases_json if defined
+        custom_use_cases = []
+        if getattr(task, "custom_use_cases_json", None):
+            try:
+                custom_use_cases = json.loads(task.custom_use_cases_json)
+                if not isinstance(custom_use_cases, list):
+                    custom_use_cases = []
+            except Exception as e:
+                logger.error(f"Error parsing custom_use_cases_json: {e}")
+                write_orchestrator_log(f"[Orchestrator] Warning: Failed to parse custom use cases: {e}")
+
+        # Combine AI-generated and custom use cases
+        all_use_cases_to_create = []
+        # AI-generated
+        for uc_data in analysis.get("use_cases", []):
+            all_use_cases_to_create.append((uc_data, False)) # (data, is_custom)
+        # Custom
+        for uc_data in custom_use_cases:
+            all_use_cases_to_create.append((uc_data, True)) # (data, is_custom)
+
         use_cases_mapping = {}
         use_case_titles = {}
-        for uc_data in analysis.get("use_cases", []):
-            use_case = UseCase(task_id=task.id, title=uc_data["title"], description=uc_data.get("description"))
+        for uc_data, is_custom in all_use_cases_to_create:
+            title_prefix = "[Custom] " if is_custom else ""
+            uc_title = f"{title_prefix}{uc_data['title']}"
+            use_case = UseCase(
+                task_id=task.id, 
+                title=uc_title, 
+                description=uc_data.get("description")
+            )
             db.add(use_case)
             db.flush()
-            use_cases_mapping[use_case.id] = uc_data.get("test_cases", [])
-            use_case_titles[use_case.id] = uc_data.get("title")
+            
+            # Prepare test cases
+            tc_list = []
+            for tc_data in uc_data.get("test_cases", []):
+                tc_item = {
+                    "title": tc_data.get("title", "Custom Test"),
+                    "steps": tc_data.get("steps", ""),
+                    "expected_result": tc_data.get("expected_result", ""),
+                    "status": "pending",
+                    "severity": tc_data.get("severity") or "medium",
+                    "page_url": tc_data.get("page_url") or task.url,
+                    "check_type": tc_data.get("check_type") or "custom_scenario"
+                }
+                tc_list.append(tc_item)
+                
+            use_cases_mapping[use_case.id] = tc_list
+            use_case_titles[use_case.id] = uc_title
+
         write_orchestrator_log(f"[Orchestrator] Persisted {len(use_cases_mapping)} use case record(s).")
 
         for sug_data in analysis.get("suggestions", []):

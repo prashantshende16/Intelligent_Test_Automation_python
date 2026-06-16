@@ -14,6 +14,9 @@ class Task(Base):
     url = Column(String, nullable=False)
     status = Column(String, default="pending") # pending, crawling, generating_test_cases, running_tests, completed, failed
     is_mobile = Column(Integer, default=0) # 0 = desktop, 1 = mobile
+    ai_model = Column(String, default="gemini-1.5-flash")
+    user_prompt = Column(Text, nullable=True)
+    custom_use_cases_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
@@ -52,6 +55,7 @@ class TestCase(Base):
     status = Column(String, default="pending") # pending, passed, failed
     error_message = Column(Text, nullable=True)
     execution_time = Column(Float, nullable=True) # in seconds
+    page_url = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("Task", back_populates="test_cases")

@@ -9,6 +9,9 @@ class TaskCreate(TaskBase):
     codebase_path: Optional[str] = None
     seed_urls: Optional[List[str]] = None
     is_mobile: Optional[bool] = False
+    ai_model: Optional[str] = "gemini-1.5-flash"
+    user_prompt: Optional[str] = None
+    custom_use_cases_json: Optional[str] = None
     auth_required: Optional[bool] = False
     auth_login_url: Optional[str] = None
     auth_post_login_url: Optional[str] = None
@@ -34,12 +37,18 @@ class TaskInputUpdate(BaseModel):
     form_values_json: Optional[str] = None
     seed_urls: Optional[List[str]] = None
     is_mobile: Optional[bool] = None
+    ai_model: Optional[str] = None
+    user_prompt: Optional[str] = None
+    custom_use_cases_json: Optional[str] = None
 
 class TaskResponse(BaseModel):
     id: str
     url: str
     status: str
     is_mobile: Optional[bool] = False
+    ai_model: Optional[str] = "gemini-1.5-flash"
+    user_prompt: Optional[str] = None
+    custom_use_cases_json: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
     
@@ -72,6 +81,7 @@ class TestCaseResponse(BaseModel):
     status: str
     error_message: Optional[str] = None
     execution_time: Optional[float] = None
+    page_url: Optional[str] = None
     created_at: datetime
 
     class Config:

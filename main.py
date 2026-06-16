@@ -43,16 +43,30 @@ def ensure_task_auth_columns():
 
 ensure_task_auth_columns()
 
-def ensure_task_mobile_column():
+def ensure_task_columns():
     inspector = inspect(engine)
-    if "tasks" not in inspector.get_table_names():
-        return
-    columns = {col["name"] for col in inspector.get_columns("tasks")}
-    if "is_mobile" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE tasks ADD COLUMN is_mobile INTEGER DEFAULT 0"))
+    if "tasks" in inspector.get_table_names():
+        columns = {col["name"] for col in inspector.get_columns("tasks")}
+        if "is_mobile" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN is_mobile INTEGER DEFAULT 0"))
+        if "ai_model" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN ai_model VARCHAR DEFAULT 'gemini-1.5-flash'"))
+        if "user_prompt" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN user_prompt TEXT"))
+        if "custom_use_cases_json" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN custom_use_cases_json TEXT"))
 
-ensure_task_mobile_column()
+    if "test_cases" in inspector.get_table_names():
+        tc_columns = {col["name"] for col in inspector.get_columns("test_cases")}
+        if "page_url" not in tc_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE test_cases ADD COLUMN page_url VARCHAR"))
+
+ensure_task_columns()
 
 app = FastAPI(title="AI Website Testing Automation API")
 
@@ -85,6 +99,9 @@ def get_task_with_counts(task: models.Task, db: Session) -> schemas.TaskResponse
         url=task.url,
         status=task.status,
         is_mobile=bool(task.is_mobile),
+        ai_model=task.ai_model,
+        user_prompt=task.user_prompt,
+        custom_use_cases_json=task.custom_use_cases_json,
         created_at=task.created_at,
         completed_at=task.completed_at,
         use_case_count=use_case_count,
@@ -110,7 +127,10 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
     db_task = models.Task(
         url=task_in.url,
         status="pending",
-        is_mobile=1 if task_in.is_mobile else 0
+        is_mobile=1 if task_in.is_mobile else 0,
+        ai_model=task_in.ai_model,
+        user_prompt=task_in.user_prompt,
+        custom_use_cases_json=task_in.custom_use_cases_json
     )
     db.add(db_task)
     db.commit()
@@ -220,6 +240,15 @@ def update_task_input(task_id: str, task_input: schemas.TaskInputUpdate, db: Ses
 
     if task_input.is_mobile is not None:
         task.is_mobile = 1 if task_input.is_mobile else 0
+
+    if task_input.ai_model is not None:
+        task.ai_model = task_input.ai_model
+
+    if task_input.user_prompt is not None:
+        task.user_prompt = task_input.user_prompt
+
+    if task_input.custom_use_cases_json is not None:
+        task.custom_use_cases_json = task_input.custom_use_cases_json
 
     task.status = "pending"
     task.completed_at = None
