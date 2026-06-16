@@ -4,6 +4,10 @@ import os
 import json
 import csv
 import io
+import openpyxl
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -460,6 +464,239 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
     filename = f"{task.id}_test_report.csv"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
+
+@app.get("/api/tasks/{task_id}/report.xlsx")
+def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    use_cases = db.query(models.UseCase).filter(models.UseCase.task_id == task_id).all()
+    test_cases = db.query(models.TestCase).filter(models.TestCase.task_id == task_id).all()
+    errors = db.query(models.TestError).filter(models.TestError.task_id == task_id).all()
+    suggestions = db.query(models.Suggestion).filter(models.Suggestion.task_id == task_id).all()
+    codebase = db.query(models.Codebase).filter(models.Codebase.task_id == task_id).first()
+    auth = db.query(models.TaskAuth).filter(models.TaskAuth.task_id == task_id).first()
+    seeds = db.query(models.TaskSeed).filter(models.TaskSeed.task_id == task_id).first()
+    agent_states = db.query(models.AgentState).filter(models.AgentState.task_id == task_id).all()
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Test Report"
+    ws.views.sheetView[0].showGridLines = True
+
+    # Style presets
+    section_font = Font(name="Segoe UI", size=13, bold=True, color="1F4E79")
+    header_font = Font(name="Segoe UI", size=10, bold=True, color="FFFFFF")
+    header_fill = PatternFill(start_color="2F5597", end_color="2F5597", fill_type="solid")
+    data_font = Font(name="Segoe UI", size=10, color="000000")
+    
+    thin_border_side = Side(border_style="thin", color="D9D9D9")
+    thin_border = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
+    
+    section_border_side = Side(border_style="medium", color="1F4E79")
+    section_border = Border(bottom=section_border_side)
+
+    def write_section(title: str):
+        if ws.max_row > 1 or (ws.max_row == 1 and ws.cell(row=1, column=1).value is not None):
+            ws.append([])
+        ws.append([title.upper()])
+        row_idx = ws.max_row
+        cell = ws.cell(row=row_idx, column=1)
+        cell.font = section_font
+        cell.border = section_border
+
+    def write_headers(headers: List[str]):
+        ws.append(headers)
+        row_idx = ws.max_row
+        for col_idx in range(1, len(headers) + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="left", vertical="center")
+            cell.border = thin_border
+        ws.row_dimensions[row_idx].height = 24
+
+    def write_row(row_data: List):
+        processed_row = []
+        for val in row_data:
+            if isinstance(val, datetime):
+                processed_row.append(val.isoformat())
+            elif isinstance(val, bool):
+                processed_row.append(str(val))
+            elif val is None:
+                processed_row.append("")
+            else:
+                processed_row.append(val)
+
+        ws.append(processed_row)
+        row_idx = ws.max_row
+        for col_idx in range(1, len(processed_row) + 1):
+            cell = ws.cell(row=row_idx, column=col_idx)
+            cell.font = data_font
+            cell.border = thin_border
+            cell.alignment = Alignment(vertical="center")
+        ws.row_dimensions[row_idx].height = 20
+
+    # Section 1: Task Summary
+    write_section("Task Summary")
+    write_headers(["TASK ID", "URL", "STATUS", "CREATED AT", "COMPLETED AT", "TEST CASES", "ERRORS", "SUGGESTIONS"])
+    write_row([
+        task.id,
+        task.url,
+        task.status,
+        task.created_at,
+        task.completed_at,
+        len(test_cases),
+        len(errors),
+        len(suggestions)
+    ])
+
+    # Section 2: Codebase
+    write_section("Codebase")
+    write_headers(["PATH", "FRAMEWORK", "ANALYZED AT"])
+    if codebase:
+        write_row([
+            codebase.local_path,
+            codebase.framework_type,
+            codebase.analyzed_at
+        ])
+    else:
+        write_row(["Not provided", "", ""])
+
+    # Section 3: Authentication
+    write_section("Authentication")
+    write_headers(["AUTH REQUIRED", "LOGIN URL", "USERNAME", "OTP HINT"])
+    if auth:
+        write_row([
+            bool(auth.auth_required),
+            auth.auth_login_url or "",
+            auth.auth_username or "",
+            auth.auth_otp_hint or ""
+        ])
+    else:
+        write_row(["Not provided", "", "", ""])
+
+    # Section 4: Seed URLs
+    write_section("Seed URLs")
+    write_headers(["SEED URL"])
+    if seeds and seeds.seed_urls_json:
+        try:
+            seed_list = json.loads(seeds.seed_urls_json)
+        except Exception:
+            seed_list = [seeds.seed_urls_json]
+        for seed in seed_list:
+            write_row([seed])
+    else:
+        write_row(["Not provided"])
+
+    # Section 5: Use Cases
+    write_section("Use Cases")
+    write_headers(["USE CASE TITLE", "PAGE URL", "DESCRIPTION", "CREATED AT", "USE CASE ID"])
+    
+    test_case_page_urls = {}
+    for err in errors:
+        if err.test_case_id and err.page_url:
+            test_case_page_urls[err.test_case_id] = err.page_url
+            
+    use_case_page_urls = {}
+    for tc in test_cases:
+        if not tc.use_case_id:
+            continue
+        page_url = test_case_page_urls.get(tc.id)
+        if page_url:
+            use_case_page_urls.setdefault(tc.use_case_id, page_url)
+            
+    for err in errors:
+        if not err.test_case_id or not err.page_url:
+            continue
+        tc = next((item for item in test_cases if item.id == err.test_case_id), None)
+        if tc and tc.use_case_id:
+            use_case_page_urls.setdefault(tc.use_case_id, err.page_url)
+            
+    for uc in use_cases:
+        write_row([
+            uc.title,
+            use_case_page_urls.get(uc.id, ""),
+            uc.description or "",
+            uc.created_at,
+            uc.id
+        ])
+
+    # Section 6: Test Cases
+    write_section("Test Cases")
+    write_headers(["TITLE", "STATUS", "PAGE URL", "EXPECTED RESULT", "ERROR MESSAGE", "STEPS", "EXECUTION TIME", "CREATED AT", "USE CASE ID"])
+    for tc in test_cases:
+        write_row([
+            tc.title,
+            tc.status,
+            test_case_page_urls.get(tc.id, ""),
+            tc.expected_result or "",
+            tc.error_message or "",
+            tc.steps or "",
+            tc.execution_time if tc.execution_time is not None else "",
+            tc.created_at,
+            tc.use_case_id or "",
+        ])
+
+    # Section 7: Errors
+    write_section("Errors")
+    write_headers(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "CREATED AT", "TEST CASE ID"])
+    for err in errors:
+        write_row([
+            err.message,
+            err.severity,
+            err.page_url,
+            err.screenshot_path or "",
+            err.created_at,
+            err.test_case_id or "",
+        ])
+
+    # Section 8: Suggestions
+    write_section("Suggestions")
+    write_headers(["TITLE", "PRIORITY", "DESCRIPTION", "CREATED AT"])
+    for sug in suggestions:
+        write_row([
+            sug.title,
+            sug.priority,
+            sug.description or "",
+            sug.created_at
+        ])
+
+    # Section 9: Agent States
+    write_section("Agent States")
+    write_headers(["AGENT", "STATUS", "WARNINGS", "STARTED AT", "COMPLETED AT", "LOG OUTPUT"])
+    for agent in agent_states:
+        write_row([
+            agent.agent_name,
+            agent.status,
+            str(agent.errors_found),
+            agent.started_at,
+            agent.completed_at,
+            (agent.log_output or "").replace("\n", " | "),
+        ])
+
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            val_str = str(cell.value or "")
+            if len(val_str) > 100:
+                val_str = val_str[:100]
+            max_len = max(max_len, len(val_str))
+        ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 50)
+
+    file_stream = io.BytesIO()
+    wb.save(file_stream)
+    file_stream.seek(0)
+
+    filename = f"{task.id}_test_report.xlsx"
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    return StreamingResponse(
+        file_stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers
+    )
 
 @app.delete("/api/tasks/{task_id}")
 def delete_task(task_id: str, db: Session = Depends(get_db)):
