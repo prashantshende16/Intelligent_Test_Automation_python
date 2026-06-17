@@ -1748,16 +1748,34 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                 pass
 
 
-def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
+def run_test_validation(page, context, test_data: dict, profile: dict, auth: dict = None) -> tuple:
     """Execute a live browser check and return (status, error_message, severity)."""
     check_type = test_data.get("check_type", "")
     page_url = normalize_url(test_data.get("page_url") or profile["url"])
     title = profile["primary_title"]
     domain = profile["domain"]
 
+    def safe_goto(url):
+        response = page.goto(url, wait_until="domcontentloaded")
+        if auth and auth.get("auth_required"):
+            current_url_lower = page.url.lower()
+            url_lower = url.lower()
+            login_keywords = ["/login", "/signin", "/sign-in", "/auth"]
+            has_login_current = any(k in current_url_lower for k in login_keywords)
+            has_login_intended = any(k in url_lower for k in login_keywords)
+            if has_login_current and not has_login_intended:
+                logger.info(f"[SelfHealing] Detected login redirect from {url} to {page.url}. Attempting to re-authenticate context.")
+                success = authenticate_browser_context(page, auth, url, logger.info)
+                if success:
+                    logger.info(f"[SelfHealing] Re-authentication successful. Navigating back to {url}")
+                    response = page.goto(url, wait_until="domcontentloaded")
+                else:
+                    logger.warning(f"[SelfHealing] Re-authentication failed after redirect to {page.url}")
+        return response
+
     try:
         if check_type == "page_load":
-            response = page.goto(page_url, wait_until="domcontentloaded")
+            response = safe_goto(page_url)
             status = response.status if response else 500
             if status != 200:
                 return "failed", f"Page '{title}' on {domain} returned HTTP {status}. The server did not load the page successfully.", "critical"
@@ -1765,7 +1783,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
                 return "failed", f"Page '{title}' on {domain} appears blocked by bot protection. The page content could not be fully inspected.", "high"
             return "passed", None, None
 
-        page.goto(page_url, wait_until="domcontentloaded")
+        safe_goto(page_url)
 
         if check_type == "link_health":
             broken = []
@@ -1775,6 +1793,15 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
                 if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
                     continue
                 target = href if href.startswith("http") else urljoin(page_url, href)
+                
+                # Check for logout links to prevent logging out during health check
+                target_lower = target.lower()
+                text_lower = (link.get("text") or "").lower()
+                logout_keywords = ["logout", "log-out", "signout", "sign-out", "log_out", "sign_out"]
+                if any(k in target_lower or k in text_lower for k in logout_keywords):
+                    logger.info(f"[LinkHealth] Skipping logout link: href={href}, text={link.get('text')}")
+                    continue
+                
                 try:
                     response = context.request.get(target, timeout=10000)
                     checked += 1
@@ -1835,7 +1862,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
             return "passed", None, None
 
         if check_type == "manual_page_load":
-            response = page.goto(page_url, wait_until="domcontentloaded")
+            response = safe_goto(page_url)
             status = response.status if response else 500
             body_text = (page.locator("body").inner_text(timeout=5000) or "").strip()
             if status != 200:
@@ -1845,7 +1872,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
             return "passed", None, None
 
         if check_type == "manual_blocker_check":
-            response = page.goto(page_url, wait_until="domcontentloaded")
+            response = safe_goto(page_url)
             status = response.status if response else 500
             body_text = (page.locator("body").inner_text(timeout=5000) or "").strip()
             console_messages = []
@@ -1866,15 +1893,15 @@ def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
         # Legacy/Gemini tests without check_type — validate keywords against live page
         title_lower = test_data.get("title", "").lower()
         if "required field" in title_lower:
-            return run_test_validation(page, context, {**test_data, "check_type": "form_required"}, profile)
+            return run_test_validation(page, context, {**test_data, "check_type": "form_required"}, profile, auth=auth)
         if "navigation" in title_lower or "link" in title_lower:
             if not profile["links"]:
-                return run_test_validation(page, context, {**test_data, "check_type": "navigation_presence"}, profile)
-            return run_test_validation(page, context, {**test_data, "check_type": "link_health"}, profile)
+                return run_test_validation(page, context, {**test_data, "check_type": "navigation_presence"}, profile, auth=auth)
+            return run_test_validation(page, context, {**test_data, "check_type": "link_health"}, profile, auth=auth)
         if "heading" in title_lower:
-            return run_test_validation(page, context, {**test_data, "check_type": "heading_structure"}, profile)
+            return run_test_validation(page, context, {**test_data, "check_type": "heading_structure"}, profile, auth=auth)
         if "content" in title_lower:
-            return run_test_validation(page, context, {**test_data, "check_type": "content_depth"}, profile)
+            return run_test_validation(page, context, {**test_data, "check_type": "content_depth"}, profile, auth=auth)
 
         preset_status = test_data.get("status", "passed")
         if preset_status == "pending":
@@ -1998,41 +2025,85 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                 except Exception:
                     pass
 
-                page_url = normalize_url(test_data.get("page_url", base_url))
+                is_existing_model = not isinstance(test_data, dict)
+                if is_existing_model:
+                    tc_id = test_data.id
+                    tc_title = test_data.title
+                    tc_steps = test_data.steps
+                    tc_expected = test_data.expected_result
+                    page_url = normalize_url(test_data.page_url or base_url)
+                    test_data_dict = {
+                        "title": tc_title,
+                        "steps": tc_steps,
+                        "expected_result": tc_expected,
+                        "page_url": page_url,
+                        "severity": "medium",
+                        "check_type": "custom_scenario"
+                    }
+                else:
+                    tc_id = None
+                    tc_title = test_data.get("title", "Anonymous Test")
+                    tc_steps = test_data.get("steps")
+                    tc_expected = test_data.get("expected_result")
+                    page_url = normalize_url(test_data.get("page_url", base_url))
+                    test_data_dict = test_data
+
                 test_profile = page_profiles.get(page_url, profile)
                 if log_callback:
-                    log_callback(f"[Orchestrator] Testing page: {page_url} :: {test_data.get('title', 'Anonymous Test')}")
-                actual_status, actual_error, severity = run_test_validation(page, context, test_data, test_profile)
+                    log_callback(f"[Orchestrator] Testing page: {page_url} :: {tc_title}")
+
+                # Update status of existing test case to "running" in the DB before executing
+                if is_existing_model:
+                    db = SessionLocal()
+                    try:
+                        db_tc = db.query(TestCase).filter(TestCase.id == tc_id).first()
+                        if db_tc:
+                            db_tc.status = "running"
+                            db.commit()
+                    finally:
+                        db.close()
+
+                actual_status, actual_error, severity_val = run_test_validation(page, context, test_data_dict, test_profile, auth)
                 if log_callback:
                     outcome = "passed" if actual_status == "passed" else "failed"
                     log_callback(f"[Orchestrator] Result: {outcome} for {page_url}")
 
                 db = SessionLocal()
                 try:
-                    test_case = TestCase(
-                        task_id=task_id,
-                        use_case_id=use_case_id,
-                        title=test_data.get("title", "Anonymous Test"),
-                        steps=test_data.get("steps"),
-                        expected_result=test_data.get("expected_result"),
-                        status=actual_status,
-                        error_message=actual_error,
-                        execution_time=round(0.5 + float(time.time() % 1), 2),
-                        page_url=page_url
-                    )
-                    db.add(test_case)
-                    db.commit()
-                    db.refresh(test_case)
+                    test_case = None
+                    if is_existing_model:
+                        test_case = db.query(TestCase).filter(TestCase.id == tc_id).first()
+                        if test_case:
+                            test_case.status = actual_status
+                            test_case.error_message = actual_error
+                            test_case.execution_time = round(0.5 + float(time.time() % 1), 2)
+                            db.commit()
+                            db.refresh(test_case)
+                    else:
+                        test_case = TestCase(
+                            task_id=task_id,
+                            use_case_id=use_case_id,
+                            title=tc_title,
+                            steps=tc_steps,
+                            expected_result=tc_expected,
+                            status=actual_status,
+                            error_message=actual_error,
+                            execution_time=round(0.5 + float(time.time() % 1), 2),
+                            page_url=page_url
+                        )
+                        db.add(test_case)
+                        db.commit()
+                        db.refresh(test_case)
 
-                    if actual_status == "failed":
-                        screenshot_name = f"{slugify(use_case_titles.get(use_case_id, 'use_case'))}_{slugify(test_data.get('title'))}.png"
+                    if actual_status == "failed" and test_case:
+                        screenshot_name = f"{slugify(use_case_titles.get(use_case_id, 'use_case'))}_{slugify(tc_title)}.png"
                         screenshot_path = os.path.join(screenshot_dir, screenshot_name)
                         save_screenshot(page, screenshot_path)
                         test_error = TestError(
                             task_id=task_id,
                             test_case_id=test_case.id,
                             message=actual_error or "Validation failed during execution.",
-                            severity=severity or test_data.get("severity", "medium") or "medium",
+                            severity=severity_val or (test_data.get("severity") if isinstance(test_data, dict) else "medium") or "medium",
                             page_url=page_url,
                             screenshot_path=screenshot_path
                         )
@@ -3081,7 +3152,6 @@ def run_testing_agent(task_id: str):
             all_use_cases_to_create.append((uc_data, True)) # (data, is_custom)
 
         use_cases_mapping = {}
-        use_case_titles = {}
         for uc_data, is_custom in all_use_cases_to_create:
             title_prefix = "[Custom] " if is_custom else ""
             uc_title = f"{title_prefix}{uc_data['title']}"
@@ -3093,24 +3163,18 @@ def run_testing_agent(task_id: str):
             db.add(use_case)
             db.flush()
             
-            # Prepare test cases
-            tc_list = []
+            # Prepare and persist test cases
             for tc_data in uc_data.get("test_cases", []):
-                tc_item = {
-                    "title": tc_data.get("title", "Custom Test"),
-                    "steps": tc_data.get("steps", ""),
-                    "expected_result": tc_data.get("expected_result", ""),
-                    "status": "pending",
-                    "severity": tc_data.get("severity") or "medium",
-                    "page_url": tc_data.get("page_url") or task.url,
-                    "check_type": tc_data.get("check_type") or "custom_scenario"
-                }
-                tc_list.append(tc_item)
-                
-            use_cases_mapping[use_case.id] = tc_list
-            use_case_titles[use_case.id] = uc_title
-
-        write_orchestrator_log(f"[Orchestrator] Persisted {len(use_cases_mapping)} use case record(s).")
+                test_case = TestCase(
+                    task_id=task.id,
+                    use_case_id=use_case.id,
+                    title=tc_data.get("title", "Custom Test"),
+                    steps=tc_data.get("steps", ""),
+                    expected_result=tc_data.get("expected_result", ""),
+                    status="pending",
+                    page_url=tc_data.get("page_url") or task.url
+                )
+                db.add(test_case)
 
         for sug_data in analysis.get("suggestions", []):
             suggestion = Suggestion(
@@ -3122,15 +3186,149 @@ def run_testing_agent(task_id: str):
             db.add(suggestion)
 
         db.commit()
-        write_orchestrator_log(f"[Orchestrator] Persisted {len(analysis.get('suggestions', []))} suggestion record(s).")
 
         if is_cancelled():
             return
+
+        # Save snapshots and transition to planned
+        task.page_snapshots_json = json.dumps(page_snapshots)
+        task.status = "planned"
+        if orchestrator_state:
+            orchestrator_state.status = "completed"
+            orchestrator_state.log_output = (orchestrator_state.log_output or "") + "[Orchestrator] Planning complete. Ready to run tests on demand.\n"
+            orchestrator_state.completed_at = datetime.utcnow()
+        db.commit()
+        write_orchestrator_log("[Orchestrator] Planning complete. Ready to run tests on demand.")
+        logger.info(f"AI Agent planning background task completed for task ID: {task_id}")
+
+    except Exception as exc:
+        logger.error(f"Error executing AI testing agent: {exc}")
+        logger.error(traceback.format_exc())
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task and task.status != "stopped":
+            task.status = "failed"
+            task.completed_at = datetime.utcnow()
+        orchestrator_state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Orchestrator").first()
+        if orchestrator_state:
+            orchestrator_state.status = "failed"
+            orchestrator_state.log_output = (orchestrator_state.log_output or "") + f"[Orchestrator Error] {exc}\n"
+            orchestrator_state.log_output += traceback.format_exc()
+            orchestrator_state.completed_at = datetime.utcnow()
+        db.commit()
+    finally:
+        db.close()
+
+
+def run_test_execution_agent(task_id: str):
+    logger.info(f"Starting AI Agent test execution background task for task ID: {task_id}")
+    db: Session = SessionLocal()
+
+    try:
+        def write_orchestrator_log(message: str):
+            if not orchestrator_state:
+                return
+            current = orchestrator_state.log_output or ""
+            orchestrator_state.log_output = current + message.rstrip() + "\n"
+            orchestrator_state.completed_at = None
+            db.commit()
+
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            logger.error(f"Task {task_id} not found in database.")
+            return
+
+        def is_cancelled() -> bool:
+            try:
+                db.expire(task)
+                current_status = db.query(Task.status).filter(Task.id == task_id).scalar()
+                return current_status == "stopped"
+            except Exception:
+                return False
+
+        if is_cancelled():
+            return
+
         task.status = "running_tests"
         db.commit()
-        write_orchestrator_log("[Orchestrator] Stage: running_tests")
-        write_orchestrator_log("[Orchestrator] Executing browser-driven test validations.")
 
+        # Reset agent states
+        for state_name in ["Orchestrator", "UI_UX", "Responsive", "Form", "API", "Image", "CodeReview"]:
+            state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == state_name).first()
+            if state:
+                state.status = "pending"
+                state.started_at = None
+                state.completed_at = None
+                state.log_output = ""
+                state.errors_found = 0
+        db.commit()
+
+        orchestrator_state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Orchestrator").first()
+        if orchestrator_state:
+            orchestrator_state.status = "running"
+            orchestrator_state.started_at = datetime.utcnow()
+            orchestrator_state.log_output = "[Orchestrator] Started test execution phase.\n"
+            db.commit()
+            write_orchestrator_log("[Orchestrator] Stage: running_tests")
+
+        # Load page snapshots and codebase
+        page_snapshots = []
+        if task.page_snapshots_json:
+            try:
+                page_snapshots = json.loads(task.page_snapshots_json)
+            except Exception as e:
+                logger.error(f"Error decoding page_snapshots_json: {e}")
+
+        codebase = db.query(Codebase).filter(Codebase.task_id == task_id).first()
+        codebase_data = {
+            "framework_type": "HTML/JS",
+            "file_list": [],
+            "existing_tests": [],
+            "routing_files": [],
+            "components": [],
+            "file_tree": {}
+        }
+        if codebase:
+            if codebase.file_tree:
+                try:
+                    codebase_data["file_tree"] = json.loads(codebase.file_tree)
+                except Exception:
+                    pass
+            codebase_data["framework_type"] = codebase.framework_type
+            codebase_data["codebase_path"] = codebase.local_path
+
+        auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+        auth_data = None
+        if auth:
+            auth_data = {
+                "auth_required": bool(auth.auth_required),
+                "auth_login_url": auth.auth_login_url,
+                "auth_post_login_url": auth.auth_post_login_url,
+                "auth_username": auth.auth_username,
+                "auth_password": auth.auth_password,
+                "auth_otp_code": auth.auth_otp_code,
+                "auth_otp_hint": auth.auth_otp_hint,
+                "auth_flow": auth.auth_flow,
+                "auth_next_step": auth.auth_next_step,
+                "auth_required_fields": auth.auth_required_fields,
+            }
+
+        # Build use_cases_mapping and use_case_titles from DB
+        use_cases = db.query(UseCase).filter(UseCase.task_id == task_id).all()
+        use_cases_mapping = {}
+        use_case_titles = {}
+        for uc in use_cases:
+            test_cases = db.query(TestCase).filter(TestCase.use_case_id == uc.id).all()
+            # Reset their status to pending when starting execution
+            for tc in test_cases:
+                tc.status = "pending"
+                tc.error_message = None
+                tc.execution_time = None
+            db.commit()
+            
+            use_cases_mapping[uc.id] = test_cases
+            use_case_titles[uc.id] = uc.title
+
+        # Run parallel heuristic analysis agents
         with ThreadPoolExecutor(max_workers=5) as executor:
             executor.submit(run_ui_ux_agent, task.id, task.url, page_snapshots, codebase_data)
             executor.submit(run_responsive_agent, task.id, task.url, page_snapshots, codebase_data)
@@ -3139,7 +3337,13 @@ def run_testing_agent(task_id: str):
             executor.submit(run_image_agent, task.id, task.url, page_snapshots, codebase_data)
 
         time.sleep(2.5)
+
+        # Run the browser-driven Playwright tests
         error_ids = execute_test_plan(task.id, page_snapshots, use_cases_mapping, use_case_titles, auth=auth_data, log_callback=write_orchestrator_log)
+        
+        if is_cancelled():
+            return
+
         auth_issue = (auth_data or {}).get("_codex_auth_issue")
         if auth_issue:
             if auth:
@@ -3162,6 +3366,7 @@ def run_testing_agent(task_id: str):
                 db.commit()
             logger.info(f"Task {task_id} paused awaiting auth input: {auth_issue}")
             return
+
         write_orchestrator_log(f"[Orchestrator] Browser validations completed with {len(error_ids)} error(s).")
 
         if codebase and error_ids:
@@ -3183,10 +3388,10 @@ def run_testing_agent(task_id: str):
             orchestrator_state.log_output = (orchestrator_state.log_output or "") + "[Orchestrator] Pipeline complete.\n"
             orchestrator_state.completed_at = datetime.utcnow()
         db.commit()
-        logger.info(f"AI Agent background task completed for task ID: {task_id}")
+        logger.info(f"AI Agent test execution background task completed for task ID: {task_id}")
 
     except Exception as exc:
-        logger.error(f"Error executing AI testing agent: {exc}")
+        logger.error(f"Error executing AI testing agent execution: {exc}")
         logger.error(traceback.format_exc())
         task = db.query(Task).filter(Task.id == task_id).first()
         if task and task.status != "stopped":
@@ -3201,3 +3406,4 @@ def run_testing_agent(task_id: str):
         db.commit()
     finally:
         db.close()
+

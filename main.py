@@ -18,7 +18,7 @@ from typing import List
 from database import engine, Base, get_db
 import models
 import schemas
-from agent import run_testing_agent
+from agent import run_testing_agent, run_test_execution_agent
 
 # Initialize Database tables
 Base.metadata.create_all(bind=engine)
@@ -59,6 +59,9 @@ def ensure_task_columns():
         if "custom_use_cases_json" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN custom_use_cases_json TEXT"))
+        if "page_snapshots_json" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN page_snapshots_json TEXT"))
 
     if "test_cases" in inspector.get_table_names():
         tc_columns = {col["name"] for col in inspector.get_columns("test_cases")}
@@ -102,6 +105,7 @@ def get_task_with_counts(task: models.Task, db: Session) -> schemas.TaskResponse
         ai_model=task.ai_model,
         user_prompt=task.user_prompt,
         custom_use_cases_json=task.custom_use_cases_json,
+        page_snapshots_json=task.page_snapshots_json,
         created_at=task.created_at,
         completed_at=task.completed_at,
         use_case_count=use_case_count,
@@ -285,6 +289,35 @@ def stop_task(task_id: str, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(task)
     return get_task_with_counts(task, db)
+
+
+def start_test_execution_thread(task_id: str) -> None:
+    thread = threading.Thread(target=run_test_execution_agent, args=(task_id,))
+    thread.daemon = True
+    thread.start()
+
+
+@app.post("/api/tasks/{task_id}/start-test", response_model=schemas.TaskResponse)
+def start_test_run(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    if task.status in ["crawling", "generating_test_cases", "running_tests"]:
+        raise HTTPException(status_code=400, detail=f"Task is in state '{task.status}' and cannot be started.")
+        
+    task.status = "running_tests"
+    task.completed_at = None
+    db.commit()
+    db.refresh(task)
+    
+    start_test_execution_thread(task.id)
+    return get_task_with_counts(task, db)
+
+
+@app.post("/api/tasks/{task_id}/stop-test", response_model=schemas.TaskResponse)
+def stop_test_run(task_id: str, db: Session = Depends(get_db)):
+    return stop_task(task_id, db)
 
 @app.get("/api/tasks", response_model=List[schemas.TaskResponse])
 def list_tasks(db: Session = Depends(get_db)):
@@ -774,7 +807,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     status_counts = {status: count for status, count in status_query}
     
     # Initialize missing statuses to zero for client predictability
-    for status in ["pending", "crawling", "generating_test_cases", "running_tests", "completed", "failed"]:
+    for status in ["pending", "crawling", "generating_test_cases", "planned", "running_tests", "completed", "failed", "stopped"]:
         if status not in status_counts:
             status_counts[status] = 0
             

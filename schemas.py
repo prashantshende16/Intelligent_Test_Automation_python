@@ -49,6 +49,7 @@ class TaskResponse(BaseModel):
     ai_model: Optional[str] = "gemini-1.5-flash"
     user_prompt: Optional[str] = None
     custom_use_cases_json: Optional[str] = None
+    page_snapshots_json: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
     

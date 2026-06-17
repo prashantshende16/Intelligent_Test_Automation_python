@@ -17,6 +17,7 @@ class Task(Base):
     ai_model = Column(String, default="gemini-1.5-flash")
     user_prompt = Column(Text, nullable=True)
     custom_use_cases_json = Column(Text, nullable=True)
+    page_snapshots_json = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
 
