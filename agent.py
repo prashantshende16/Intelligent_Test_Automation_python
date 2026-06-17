@@ -439,7 +439,7 @@ def extract_page_snapshot(page, current_url: str, status_code: int = 200) -> dic
 
 def expand_navigation_regions(page) -> None:
     """Try common dashboard toggles so hidden nav/footer links become discoverable."""
-    candidate_selectors = [
+    sidebar_toggle_selectors = [
         "button[aria-label*='menu' i]",
         "button[aria-label*='navigation' i]",
         "button[aria-label*='sidebar' i]",
@@ -448,18 +448,48 @@ def expand_navigation_regions(page) -> None:
         "button:has-text('Navigation')",
         "button:has-text('Sidebar')",
         "button:has-text('More')",
-        "[role='button'][aria-expanded='false']",
     ]
-    for selector in candidate_selectors:
+    for selector in sidebar_toggle_selectors:
         try:
             loc = page.locator(selector)
-            if loc.count() > 0:
-                loc.first.click(timeout=1500)
+            count = loc.count()
+            clicked = False
+            for i in range(count):
+                el = loc.nth(i)
+                if el.is_visible():
+                    el.click(timeout=1500)
+                    clicked = True
+                    break
+            if clicked:
                 try:
-                    page.wait_for_load_state("networkidle", timeout=2000)
+                    page.wait_for_load_state("networkidle", timeout=1500)
                 except Exception:
                     pass
                 break
+        except Exception:
+            continue
+
+    dropdown_selectors = [
+        "aside [aria-expanded='false']",
+        "nav [aria-expanded='false']",
+        "[role='navigation'] [aria-expanded='false']",
+        "aside .dropdown-toggle",
+        "nav .dropdown-toggle",
+        "[role='button'][aria-expanded='false']",
+        "button[aria-expanded='false']",
+    ]
+    for selector in dropdown_selectors:
+        try:
+            loc = page.locator(selector)
+            count = loc.count()
+            for i in range(count):
+                el = loc.nth(i)
+                try:
+                    if el.is_visible() and el.get_attribute("aria-expanded") == "false":
+                        el.click(timeout=1000)
+                        page.wait_for_timeout(300)
+                except Exception:
+                    pass
         except Exception:
             continue
 
@@ -501,13 +531,16 @@ def harvest_navigation_links(page, base_url: str) -> list:
     return collected
 
 
-def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 12) -> list:
+def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 24) -> list:
     """Click dashboard navigation controls and collect routes revealed by client-side routing."""
     discovered = []
     blocked_text = ("logout", "log out", "sign out", "delete", "remove", "close", "cancel")
     candidate_selector = (
         "nav a, nav button, aside a, aside button, header a, header button, "
-        "footer a, footer button, [role='navigation'] a, [role='navigation'] button"
+        "footer a, footer button, [role='navigation'] a, [role='navigation'] button, "
+        "[class*='sidebar' i] a, [class*='sidebar' i] button, "
+        "[class*='menu' i] a, [class*='menu' i] button, "
+        "[class*='nav' i] a, [class*='nav' i] button"
     )
     try:
         count = min(page.locator(candidate_selector).count(), max_clicks)
@@ -565,7 +598,7 @@ def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 12)
     return deduped
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None) -> list:
+def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
@@ -592,17 +625,11 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
                     ignore_https_errors=True,
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 )
-            if auth and auth.get("auth_required"):
-                authenticate_browser_context(context, auth, normalized, logger.info)
             page = context.new_page()
             page.set_default_timeout(20000)
             if auth and auth.get("auth_required"):
+                authenticate_browser_context(page, auth, normalized, logger.info)
                 try:
-                    page.goto(normalized, wait_until="domcontentloaded")
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=8000)
-                    except Exception:
-                        pass
                     expand_navigation_regions(page)
                 except Exception:
                     pass
@@ -622,15 +649,19 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
                     logger.info("[Crawler] Cancellation requested. Stopping page discovery.")
                     break
                 current_url = queue.pop(0)
-                if current_url in visited:
+                if current_url.rstrip("/") in visited:
                     continue
-                visited.add(current_url)
+                visited.add(current_url.rstrip("/"))
 
                 response = None
                 try:
                     response = page.goto(current_url, wait_until="domcontentloaded")
                     try:
                         page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
+                    try:
+                        expand_navigation_regions(page)
                     except Exception:
                         pass
                 except PlaywrightTimeoutError as exc:
@@ -640,7 +671,9 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
 
                 actual_url = page.url
                 if actual_url != current_url and same_site(actual_url, normalized):
-                    visited.add(actual_url)
+                    if actual_url.rstrip("/") in visited:
+                        continue
+                    visited.add(actual_url.rstrip("/"))
                     current_url = actual_url
 
                 status_code = response.status if response else 500
@@ -654,11 +687,23 @@ def discover_pages_with_playwright(url: str, max_pages: int = 20, auth: dict = N
                 link_hrefs = harvest_navigation_links(page, current_url)
                 clicked_hrefs = click_navigation_items_for_routes(page, current_url)
 
+                high_priority_candidates = []
+                normal_priority_candidates = []
                 for href in link_hrefs + clicked_hrefs:
                     candidate_href = href.get("href") if isinstance(href, dict) else href
-                    if candidate_href and same_site(candidate_href, normalized) and candidate_href not in visited and candidate_href not in queue:
-                        if len(queue) + len(snapshots) < max_pages:
-                            queue.append(candidate_href)
+                    if candidate_href and same_site(candidate_href, normalized) and candidate_href.rstrip("/") not in visited and candidate_href not in queue:
+                        is_dynamic = any(d in candidate_href.lower() for d in ["/edit", "/delete", "/update", "/show", "/view", "/detail", "?", "#"])
+                        is_auth_kw = any(nb in candidate_href.lower() for nb in ["logout", "signout", "login", "signin"])
+                        is_admin_dashboard = any(p in candidate_href.lower() for p in ["/admin", "/dashboard", "/app", "/portal"])
+                        
+                        if is_admin_dashboard and not is_dynamic and not is_auth_kw:
+                            if candidate_href not in high_priority_candidates:
+                                high_priority_candidates.append(candidate_href)
+                        else:
+                            if candidate_href not in normal_priority_candidates:
+                                normal_priority_candidates.append(candidate_href)
+                queue = high_priority_candidates + queue
+                queue.extend(normal_priority_candidates)
 
             context.close()
             browser.close()
@@ -1308,7 +1353,7 @@ def check_and_click_guest_bypass(page, log_callback=None) -> bool:
     return False
 
 
-def authenticate_browser_context(context, auth: dict, start_url: str, log_callback=None) -> bool:
+def authenticate_browser_context(context_or_page, auth: dict, start_url: str, log_callback=None) -> bool:
     """Attempt a lightweight login flow when credentials are provided."""
     if not auth or not auth.get("auth_required"):
         return False
@@ -1323,7 +1368,13 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
     password = auth.get("auth_password") or ""
     otp_code = auth.get("auth_otp_code") or ""
 
-    page = context.new_page()
+    if hasattr(context_or_page, "new_page"):
+        context = context_or_page
+        page = context.new_page()
+        should_close_page = True
+    else:
+        page = context_or_page
+        should_close_page = False
     page.set_default_timeout(20000)
     try:
         if log_callback:
@@ -1690,10 +1741,11 @@ def authenticate_browser_context(context, auth: dict, start_url: str, log_callba
             log_callback(f"[Orchestrator] Authentication attempt failed: {exc}")
         return False
     finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+        if should_close_page:
+            try:
+                page.close()
+            except Exception:
+                pass
 
 
 def run_test_validation(page, context, test_data: dict, profile: dict) -> tuple:
@@ -1912,10 +1964,10 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                 ignore_https_errors=True,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             )
-        if auth and auth.get("auth_required"):
-            authenticate_browser_context(context, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info)
         page = context.new_page()
         page.set_default_timeout(20000)
+        if auth and auth.get("auth_required"):
+            authenticate_browser_context(page, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info)
 
         # Check for guest bypass option if no auth is required
         if not (auth and auth.get("auth_required")) and base_url:
