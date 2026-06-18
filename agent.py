@@ -1778,9 +1778,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             response = safe_goto(page_url)
             status = response.status if response else 500
             if status != 200:
-                return "failed", f"Page '{title}' on {domain} returned HTTP {status}. The server did not load the page successfully.", "critical"
+                return "failed", f"Page '{title}' failed to open and returned server error (HTTP {status}). The page did not load successfully.", "critical"
             if profile["is_blocked"]:
-                return "failed", f"Page '{title}' on {domain} appears blocked by bot protection. The page content could not be fully inspected.", "high"
+                return "failed", f"Page '{title}' is blocked by security (bot protection). We cannot inspect this page.", "high"
             return "passed", None, None
 
         safe_goto(page_url)
@@ -1812,44 +1812,44 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                 if checked >= 8:
                     break
             if not checked:
-                return "failed", f"No testable links found on {domain}. The page may be missing crawlable anchors or navigation links.", "medium"
+                return "failed", f"We found zero links to click on this page. The user has no links or buttons to go to other pages.", "medium"
             if broken:
-                return "failed", f"Broken links on {domain}: {', '.join(broken[:5])}. These targets returned errors or were unreachable during validation.", "high"
+                return "failed", f"These links are broken and not working: {', '.join(broken[:5])}. Clicking them will show errors.", "high"
             return "passed", None, None
 
         if check_type == "navigation_presence":
             link_count = page.locator("a[href]").count()
             if link_count == 0:
-                return "failed", f"No navigation links found on '{title}' ({domain}). The page does not expose clickable routes for users or crawlers.", "high"
+                return "failed", f"No navigation links or menu links found on '{title}' page. The user will get stuck on this page.", "high"
             return "passed", None, None
 
         if check_type == "internal_pages":
             if profile["page_count"] <= 1:
-                return "failed", f"Only 1 page discovered on {domain}. Internal routes were not discoverable from the crawl start page.", "medium"
+                return "failed", f"Our crawler only found 1 page on the website. No other pages or sub-pages were found.", "medium"
             return "passed", None, None
 
         if check_type == "form_required":
             if page.locator("form").count() == 0:
-                return "failed", f"No forms found on {domain} during live validation. The page was expected to contain a form but none was rendered.", "medium"
+                return "failed", f"No forms found on this page during live testing. We expected a form but none was rendered.", "medium"
             optional_inputs = page.eval_on_selector_all(
                 "form input:not([type=hidden]):not([type=submit]):not([type=button]), form textarea, form select",
                 "els => els.filter(el => !el.required && el.type !== 'hidden').map(el => el.name || el.placeholder || el.type)"
             )
             if optional_inputs:
-                return "failed", f"Form fields without required attribute on {domain}: {', '.join(optional_inputs[:5])}. These inputs can accept invalid empty submissions.", "high"
+                return "failed", f"These form fields are not marked as mandatory: {', '.join(optional_inputs[:5])}. Users can submit this form blank without filling these details.", "high"
             return "passed", None, None
 
         if check_type == "heading_structure":
             if page.locator("h1").count() == 0:
-                return "failed", f"No H1 heading on '{title}' ({domain}). The page lacks a primary title for SEO and accessibility.", "high"
+                return "failed", f"There is no main heading (H1) on '{title}' page. Every page should have a clear main title.", "high"
             return "passed", None, None
 
         if check_type == "content_depth":
             html_length = len(page.content())
             if profile["is_blocked"]:
-                return "failed", f"Page content on {domain} looks like a bot challenge, not real content. Automated inspection could not reach the actual page.", "high"
+                return "failed", f"The page is showing a bot challenge/security check instead of the real website content.", "high"
             if html_length < 3000:
-                return "failed", f"Thin page content ({html_length} bytes) on {domain}. The page may be too small, empty, or still loading content.", "low"
+                return "failed", f"The page is almost empty or loading very slowly ({html_length} bytes of content found).", "low"
             return "passed", None, None
 
         if check_type == "image_alt":
@@ -1858,7 +1858,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                 "imgs => imgs.filter(i => !(i.alt || '').trim()).map(i => (i.src || '').split('/').pop().slice(0, 40))"
             )
             if missing:
-                return "failed", f"{len(missing)} image(s) without alt text on {domain}: {', '.join(missing[:3])}. These images are missing accessible descriptions.", "medium"
+                return "failed", f"{len(missing)} image(s) do not have descriptive labels: {', '.join(missing[:3])}. Screen readers won't be able to describe these images to blind users.", "medium"
             return "passed", None, None
 
         if check_type == "manual_page_load":
@@ -1866,9 +1866,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             status = response.status if response else 500
             body_text = (page.locator("body").inner_text(timeout=5000) or "").strip()
             if status != 200:
-                return "failed", f"Manual page load failed on {domain} with HTTP {status}. Visible body preview: {body_text[:240] or 'empty body'}", "critical"
+                return "failed", f"Could not load the page. It failed with error code {status}. Visible text: {body_text[:240] or 'empty page'}", "critical"
             if len(body_text) < 40:
-                return "failed", f"Manual page load on {domain} produced very little visible content. Body preview: {body_text[:240] or 'empty body'}", "high"
+                return "failed", f"Page loaded successfully but it looks blank or has very little text. Visible text: {body_text[:240] or 'empty page'}", "high"
             return "passed", None, None
 
         if check_type == "manual_blocker_check":
@@ -1881,13 +1881,13 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             except Exception:
                 console_messages = []
             if status >= 400:
-                return "failed", f"Manual blocker check on {domain} found HTTP {status}. Visible body preview: {body_text[:240] or 'empty body'}", "critical"
+                return "failed", f"Blocker check failed with error code {status}. Visible text: {body_text[:240] or 'empty page'}", "critical"
             if looks_like_blocked_page(page.title(), page.content()[:2500], body_text):
-                return "failed", f"Manual blocker check on {domain} found bot-protection or challenge content.", "high"
+                return "failed", f"The website is showing a bot blocker or security check screen.", "high"
             if len(body_text) < 40:
-                return "failed", f"Manual blocker check on {domain} found almost no visible content. Body preview: {body_text[:240] or 'empty body'}", "high"
+                return "failed", f"The page loaded blank or contains almost no text. Visible text: {body_text[:240] or 'empty page'}", "high"
             if console_messages:
-                return "failed", f"Manual blocker check on {domain} detected console messages: {', '.join(map(str, console_messages[:5]))}", "medium"
+                return "failed", f"We detected some coding/console errors in the background: {', '.join(map(str, console_messages[:5]))}", "medium"
             return "passed", None, None
 
         # Legacy/Gemini tests without check_type — validate keywords against live page
@@ -2444,6 +2444,14 @@ Set every test case status to "pending" — pass/fail will be determined by live
 Include a "check_type" for each test case: one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages.
 Generate 2-4 suggestions that reference specific findings from THIS site's crawl data (not generic advice).
 
+CRITICAL LANGUAGE REQUIREMENT:
+All generated titles, descriptions, steps, expected results, and suggestions must be written in simple, clear, easy-to-understand Indian English (avoiding complex, overly academic, or highly programmatic technical jargon). For example, instead of using programmatic terms like "HTTP 500 response", "DOM validation script", "heading hierarchy nesting", or "SEO meta description attributes", write naturally:
+- "Check if the page is loading and opening properly."
+- "Form fields should be marked as mandatory so they cannot be submitted empty."
+- "The page is missing a main title (H1 heading)."
+- "Some links might be broken and not opening."
+Keep the sentences short, clear, and direct so a non-technical manager can understand them instantly.
+
 Your response MUST be valid JSON matching this schema:
 {
   "use_cases": [
@@ -2547,6 +2555,14 @@ Each Use Case should contain 2 specific Test Cases referencing real elements fou
 Set every test case status to "pending" — pass/fail will be determined by live browser execution.
 Include a "check_type" for each test case: one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages.
 Generate 2-4 suggestions that reference specific findings from THIS site's crawl data (not generic advice).
+
+CRITICAL LANGUAGE REQUIREMENT:
+All generated titles, descriptions, steps, expected results, and suggestions must be written in simple, clear, easy-to-understand Indian English (avoiding complex, overly academic, or highly programmatic technical jargon). For example, instead of using programmatic terms like "HTTP 500 response", "DOM validation script", "heading hierarchy nesting", or "SEO meta description attributes", write naturally:
+- "Check if the page is loading and opening properly."
+- "Form fields should be marked as mandatory so they cannot be submitted empty."
+- "The page is missing a main title (H1 heading)."
+- "Some links might be broken and not opening."
+Keep the sentences short, clear, and direct so a non-technical manager can understand them instantly.
 
 Your response MUST be valid JSON matching this schema:
 {{
