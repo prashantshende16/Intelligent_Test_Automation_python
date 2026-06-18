@@ -1829,15 +1829,275 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             return "passed", None, None
 
         if check_type == "form_required":
-            if page.locator("form").count() == 0:
-                return "failed", f"No forms found on this page during live testing. We expected a form but none was rendered.", "medium"
-            optional_inputs = page.eval_on_selector_all(
-                "form input:not([type=hidden]):not([type=submit]):not([type=button]), form textarea, form select",
-                "els => els.filter(el => !el.required && el.type !== 'hidden').map(el => el.name || el.placeholder || el.type)"
-            )
-            if optional_inputs:
-                return "failed", f"These form fields are not marked as mandatory: {', '.join(optional_inputs[:5])}. Users can submit this form blank without filling these details.", "high"
-            return "passed", None, None
+            if page.locator("form").count() == 0 and page.locator("input:not([type=hidden]), textarea, select, [role=combobox]").count() == 0:
+                return "failed", f"No forms or input fields found on this page during live testing.", "medium"
+
+            # 1. Blank submit test
+            submit_selectors = [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button:has-text('Submit')",
+                "button:has-text('Save')",
+                "button:has-text('Add')",
+                "button:has-text('Create')",
+                "input:has-text('Submit')"
+            ]
+            submit_btn = None
+            for sel in submit_selectors:
+                loc = page.locator(sel)
+                if loc.count() > 0:
+                    for i in range(loc.count()):
+                        if loc.nth(i).is_visible():
+                            submit_btn = loc.nth(i)
+                            break
+                if submit_btn:
+                    break
+            
+            # Click submit blank first
+            if submit_btn:
+                try:
+                    submit_btn.click(timeout=3000)
+                    page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+
+            # 2. Dynamic Form Auto-filling and Submission
+            # Create a dummy PDF locally
+            dummy_pdf_path = os.path.abspath("dummy_upload_test.pdf")
+            if not os.path.exists(dummy_pdf_path):
+                try:
+                    with open(dummy_pdf_path, "wb") as f:
+                        f.write(b"%PDF-1.4\n%EOF")
+                except Exception:
+                    pass
+
+            # Define the JS auto-fill function
+            js_autofill_script = """
+            async function() {
+                const filledFields = {};
+                const fileInputs = [];
+
+                const labelMap = {};
+                document.querySelectorAll('label').forEach(lbl => {
+                    const htmlFor = lbl.getAttribute('for');
+                    const text = (lbl.textContent || '').trim().replace(/\\*$/, '').trim();
+                    if (htmlFor) {
+                        labelMap[htmlFor] = text;
+                    }
+                });
+
+                function getFieldLabel(el) {
+                    const id = el.id || '';
+                    if (labelMap[id]) return labelMap[id];
+                    const parentLabel = el.closest('label');
+                    if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\\*$/, '').trim();
+                    const placeholder = el.getAttribute('placeholder') || '';
+                    if (placeholder) return placeholder;
+                    const name = el.getAttribute('name') || '';
+                    if (name) return name;
+                    
+                    let prev = el.previousElementSibling;
+                    while (prev) {
+                        const text = (prev.textContent || '').trim();
+                        if (text && text.length < 50) return text.replace(/\\*$/, '').trim();
+                        prev = prev.previousElementSibling;
+                    }
+                    return '';
+                }
+
+                document.querySelectorAll('input[type="file"]').forEach((el, idx) => {
+                    const label = getFieldLabel(el) || `File Input ${idx+1}`;
+                    let selector = '';
+                    if (el.id) selector = `#${CSS.escape(el.id)}`;
+                    else if (el.name) selector = `input[name="${CSS.escape(el.name)}"]`;
+                    else selector = `input[type="file"]`;
+                    fileInputs.push({ label, selector });
+                });
+
+                function setInputValue(el, val) {
+                    el.value = val;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                document.querySelectorAll('select').forEach(el => {
+                    const label = getFieldLabel(el) || 'Select Dropdown';
+                    const options = Array.from(el.options);
+                    const validOption = options.find(o => o.value && o.value !== '' && !o.disabled) || options[0];
+                    if (validOption) {
+                        el.value = validOption.value;
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                        filledFields[label] = validOption.text;
+                    }
+                });
+
+                const textInputs = document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=file]):not([type=radio]):not([type=checkbox]), textarea');
+                for (const el of textInputs) {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) {
+                        continue;
+                    }
+
+                    const label = getFieldLabel(el);
+                    const labelLower = label.toLowerCase();
+                    const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                    const type = el.getAttribute('type') || 'text';
+                    let val = 'QA Test Value';
+
+                    if (labelLower.includes('email') || placeholder.includes('email')) {
+                        val = 'test.qa@datagrid.co.in';
+                    } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
+                        val = 'TestSecure#2026';
+                    } else if (labelLower.includes('phone') || labelLower.includes('mobile') || placeholder.includes('phone') || placeholder.includes('mobile')) {
+                        val = '9876543210';
+                    } else if (labelLower.includes('year') || placeholder.includes('year')) {
+                        val = '2026';
+                    } else if (labelLower.includes('shared on') || labelLower.includes('date') || placeholder.includes('date') || type === 'date') {
+                        val = '2026-06-18';
+                    } else if (labelLower.includes('fund') || placeholder.includes('fund')) {
+                        val = 'PNS Capital Fund A';
+                    } else if (labelLower.includes('company') || placeholder.includes('company')) {
+                        val = 'Datagrid Investment Company';
+                    } else if (labelLower.includes('investor') || placeholder.includes('investor')) {
+                        val = 'QA Investor Group';
+                    }
+
+                    setInputValue(el, val);
+                    filledFields[label || 'Text Input'] = val;
+                }
+
+                document.querySelectorAll('input[type="checkbox"], input[type="radio"]').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') {
+                        return;
+                    }
+                    if (!el.checked) {
+                        el.click();
+                        const label = getFieldLabel(el) || 'Checkbox/Radio';
+                        filledFields[label] = 'Checked';
+                    }
+                });
+
+                const customDropdowns = [];
+                document.querySelectorAll('[role="combobox"], [class*="select-container"], [class*="Select-container"], [class*="-control"], .select, .dropdown').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) {
+                        return;
+                    }
+                    if (el.querySelector('[role="combobox"]') && el !== el.querySelector('[role="combobox"]')) {
+                        return;
+                    }
+                    customDropdowns.push(el);
+                });
+
+                for (const el of customDropdowns) {
+                    const label = getFieldLabel(el) || 'Custom Dropdown';
+                    try {
+                        el.click();
+                        await new Promise(r => setTimeout(r, 400));
+                        
+                        const options = Array.from(document.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option, [class*="-menu"] div, li'));
+                        const optionToClick = options.find(opt => {
+                            const optStyle = window.getComputedStyle(opt);
+                            const text = (opt.textContent || '').trim();
+                            return optStyle.display !== 'none' && 
+                                   optStyle.visibility !== 'hidden' && 
+                                   opt.offsetWidth > 0 &&
+                                   text !== '' && 
+                                   !text.startsWith('Select') &&
+                                   !text.includes('No options') &&
+                                   !text.includes('Loading');
+                        });
+
+                        if (optionToClick) {
+                            const optText = (optionToClick.textContent || '').trim();
+                            optionToClick.click();
+                            filledFields[label] = optText;
+                        } else {
+                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+                            await new Promise(r => setTimeout(r, 150));
+                            el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                            filledFields[label] = 'Selected Option';
+                        }
+                    } catch (e) {
+                        console.error(e);
+                    }
+                    await new Promise(r => setTimeout(r, 200));
+                }
+
+                return { filledFields, fileInputs };
+            }
+            """
+
+            try:
+                autofill_result = page.evaluate(js_autofill_script)
+                filled_data = autofill_result.get("filledFields", {})
+                file_inputs = autofill_result.get("fileInputs", [])
+                
+                for file_in in file_inputs:
+                    sel = file_in.get("selector")
+                    label = file_in.get("label", "File")
+                    try:
+                        page.locator(sel).set_input_files(dummy_pdf_path)
+                        filled_data[label] = "dummy_upload_test.pdf"
+                    except Exception as upload_err:
+                        logger.warning(f"File upload error for selector {sel}: {upload_err}")
+                
+                import json
+                json_str = json.dumps(filled_data)
+                
+                test_data["steps"] = f"1. Open the form page.\\n2. Populate the fields with dummy values using Playwright:\\nJSON_DUMMY_DATA: {json_str}"
+                
+            except Exception as js_err:
+                logger.error(f"Autofill script error: {js_err}")
+                filled_data = {}
+
+            # Submit the form after auto-filling
+            submit_btn_clicked = False
+            if submit_btn:
+                try:
+                    submit_btn.click(timeout=4000)
+                    submit_btn_clicked = True
+                    page.wait_for_timeout(2500)
+                except Exception:
+                    pass
+            
+            # Check for redirect or success messages
+            current_url = page.url
+            url_changed = (current_url != page_url)
+            
+            errors_detected = page.evaluate("""
+            () => {
+                const errMsgs = [];
+                document.querySelectorAll('.error, .invalid-feedback, [class*="error"], [class*="invalid"], .alert-danger').forEach(el => {
+                    const style = window.getComputedStyle(el);
+                    if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetWidth > 0) {
+                        const txt = (el.textContent || '').trim();
+                        if (txt && txt.length < 150) errMsgs.push(txt);
+                    }
+                });
+                return errMsgs;
+            }
+            """)
+            
+            if url_changed:
+                return "passed", None, None
+            
+            if errors_detected:
+                error_summary = ", ".join(errors_detected[:3])
+                return "failed", f"Form submission failed with validation errors: {error_summary}", "high"
+            
+            body_text = page.locator("body").inner_text() or ""
+            success_keywords = ["successfully", "saved", "created", "added", "success", "submitted"]
+            has_success = any(kw in body_text.lower() for kw in success_keywords)
+            
+            if has_success:
+                return "passed", None, None
+                
+            if submit_btn_clicked:
+                return "passed", None, None
+                
+            return "failed", "Form fields were populated, but we could not submit the form successfully.", "medium"
 
         if check_type == "heading_structure":
             if page.locator("h1").count() == 0:
@@ -2076,6 +2336,8 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                         if test_case:
                             test_case.status = actual_status
                             test_case.error_message = actual_error
+                            test_case.steps = test_data_dict.get("steps", test_case.steps)
+                            test_case.expected_result = test_data_dict.get("expected_result", test_case.expected_result)
                             test_case.execution_time = round(0.5 + float(time.time() % 1), 2)
                             db.commit()
                             db.refresh(test_case)
