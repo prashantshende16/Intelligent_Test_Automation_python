@@ -528,8 +528,7 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
     return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers=headers)
 
-@app.get("/api/tasks/{task_id}/report.xlsx")
-def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
+def generate_task_report_workbook(task_id: str, db: Session, relative_hyperlinks: bool = False) -> Workbook:
     task = db.query(models.Task).filter(models.Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -639,12 +638,20 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
                     
                     img = OpenpyxlImage(img_byte_arr)
                     
-                    # Construct URL pointing to backend served screenshot
+                    # Construct URL pointing to backend served screenshot or relative path
                     parts = screenshot_path.replace("\\", "/").split("/")
                     if len(parts) >= 3:
-                        screenshot_url = f"http://localhost:8000/api/screenshots/{parts[-2]}/{parts[-1]}"
+                        filename = parts[-1]
+                        task_folder = parts[-2]
                     else:
-                        screenshot_url = ""
+                        filename = os.path.basename(screenshot_path)
+                        task_folder = task_id
+                        
+                    if relative_hyperlinks:
+                        # Inside the ZIP, we place screenshots in the "screenshots" folder next to the Excel file
+                        screenshot_url = f"screenshots/{filename}"
+                    else:
+                        screenshot_url = f"http://localhost:8000/api/screenshots/{task_folder}/{filename}"
                     
                     cell = ws[cell_coordinate]
                     if screenshot_url:
@@ -827,7 +834,15 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
 
     # Explicitly set Column D (SCREENSHOT) to a wider size so images fit nicely
     ws.column_dimensions["D"].width = 55
+    return wb
 
+@app.get("/api/tasks/{task_id}/report.xlsx")
+def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    wb = generate_task_report_workbook(task_id, db, relative_hyperlinks=False)
     file_stream = io.BytesIO()
     wb.save(file_stream)
     file_stream.seek(0)
@@ -837,6 +852,56 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
     return StreamingResponse(
         file_stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers
+    )
+
+@app.get("/api/tasks/{task_id}/report.zip")
+def download_task_report_zip(task_id: str, db: Session = Depends(get_db)):
+    import zipfile
+    task = db.query(models.Task).filter(models.Task.id == task_id).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    # 1. Generate the Excel file with relative links
+    wb = generate_task_report_workbook(task_id, db, relative_hyperlinks=True)
+    excel_stream = io.BytesIO()
+    wb.save(excel_stream)
+    excel_stream.seek(0)
+
+    # 2. Query errors to find screenshots
+    errors = db.query(models.TestError).filter(models.TestError.task_id == task_id).all()
+
+    # 3. Create the ZIP in memory
+    zip_stream = io.BytesIO()
+    with zipfile.ZipFile(zip_stream, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        # Write Excel file to ZIP root
+        excel_filename = f"{task.id}_test_report.xlsx"
+        zip_file.writestr(excel_filename, excel_stream.getvalue())
+
+        # Write each screenshot to the screenshots/ folder inside the ZIP
+        added_screenshots = set()
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+
+        for err in errors:
+            if err.screenshot_path:
+                path_to_try = err.screenshot_path
+                if not os.path.isabs(path_to_try):
+                    path_to_try = os.path.join(backend_dir, err.screenshot_path)
+
+                if os.path.exists(path_to_try) and os.path.isfile(path_to_try):
+                    filename = os.path.basename(path_to_try)
+                    if filename not in added_screenshots:
+                        # Write to "screenshots/{filename}" in ZIP
+                        zip_file.write(path_to_try, arcname=f"screenshots/{filename}")
+                        added_screenshots.add(filename)
+
+    zip_stream.seek(0)
+
+    zip_filename = f"{task.id}_test_report.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{zip_filename}"'}
+    return StreamingResponse(
+        zip_stream,
+        media_type="application/zip",
         headers=headers
     )
 
