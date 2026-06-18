@@ -6,6 +6,7 @@ import csv
 import io
 import openpyxl
 from openpyxl import Workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
@@ -600,6 +601,67 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
             cell.alignment = Alignment(vertical="center")
         ws.row_dimensions[row_idx].height = 20
 
+    def embed_screenshot_in_cell(cell_coordinate: str, screenshot_path: str, row_idx: int):
+        if not screenshot_path:
+            return
+        path_to_try = screenshot_path
+        if not os.path.isabs(path_to_try):
+            backend_dir = os.path.dirname(os.path.abspath(__file__))
+            path_to_try = os.path.join(backend_dir, screenshot_path)
+        
+        if os.path.exists(path_to_try):
+            try:
+                from PIL import Image as PILImage
+                import io
+                
+                with PILImage.open(path_to_try) as pil_img:
+                    w, h = pil_img.size
+                    
+                    # Target constraints: max width = 400, max height = 180
+                    max_w = 400
+                    max_h = 180
+                    
+                    # Scale to fit within max_w and max_h while preserving aspect ratio
+                    ratio = min(max_w / w, max_h / h)
+                    target_width = int(w * ratio)
+                    target_height = int(h * ratio)
+                    
+                    try:
+                        resampling_filter = PILImage.Resampling.LANCZOS
+                    except AttributeError:
+                        resampling_filter = PILImage.ANTIALIAS
+                        
+                    pil_resized = pil_img.resize((target_width, target_height), resampling_filter)
+                    
+                    img_byte_arr = io.BytesIO()
+                    pil_resized.save(img_byte_arr, format='PNG')
+                    img_byte_arr.seek(0)
+                    
+                    img = OpenpyxlImage(img_byte_arr)
+                    
+                    # Construct URL pointing to backend served screenshot
+                    parts = screenshot_path.replace("\\", "/").split("/")
+                    if len(parts) >= 3:
+                        screenshot_url = f"http://localhost:8000/api/screenshots/{parts[-2]}/{parts[-1]}"
+                    else:
+                        screenshot_url = ""
+                    
+                    cell = ws[cell_coordinate]
+                    if screenshot_url:
+                        cell.value = "Click to view full screenshot"
+                        cell.hyperlink = screenshot_url
+                        cell.font = Font(name="Segoe UI", size=9, color="0563C1", underline="single", italic=True)
+                    else:
+                        cell.value = ""
+                    
+                    # Align text to the bottom center so it is visible below the image
+                    cell.alignment = Alignment(horizontal="center", vertical="bottom")
+                    
+                    ws.add_image(img, cell_coordinate)
+                    ws.row_dimensions[row_idx].height = 160  # Plenty of room for 180px image + text
+            except Exception as e:
+                ws[cell_coordinate].value = f"Error: {str(e)}"
+
     # Section 1: Task Summary
     write_section("Task Summary")
     write_headers(["TASK ID", "URL", "STATUS", "CREATED AT", "COMPLETED AT", "TEST CASES", "ERRORS", "SUGGESTIONS"])
@@ -687,12 +749,20 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
 
     # Section 6: Test Cases
     write_section("Test Cases")
-    write_headers(["TITLE", "STATUS", "PAGE URL", "EXPECTED RESULT", "ERROR MESSAGE", "STEPS", "EXECUTION TIME", "CREATED AT", "USE CASE ID"])
+    write_headers(["TITLE", "STATUS", "PAGE URL", "SCREENSHOT", "EXPECTED RESULT", "ERROR MESSAGE", "STEPS", "EXECUTION TIME", "CREATED AT", "USE CASE ID"])
+    
+    tc_screenshots = {}
+    for err in errors:
+        if err.test_case_id and err.screenshot_path:
+            tc_screenshots[err.test_case_id] = err.screenshot_path
+
     for tc in test_cases:
+        screenshot_val = tc_screenshots.get(tc.id, "")
         write_row([
             tc.title,
             tc.status,
             test_case_page_urls.get(tc.id, ""),
+            screenshot_val,
             tc.expected_result or "",
             tc.error_message or "",
             tc.steps or "",
@@ -700,19 +770,26 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
             tc.created_at,
             tc.use_case_id or "",
         ])
+        if screenshot_val:
+            row_idx = ws.max_row
+            embed_screenshot_in_cell(f"D{row_idx}", screenshot_val, row_idx)
 
     # Section 7: Errors
     write_section("Errors")
     write_headers(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "CREATED AT", "TEST CASE ID"])
     for err in errors:
+        screenshot_val = err.screenshot_path or ""
         write_row([
             err.message,
             err.severity,
             err.page_url,
-            err.screenshot_path or "",
+            screenshot_val,
             err.created_at,
             err.test_case_id or "",
         ])
+        if screenshot_val:
+            row_idx = ws.max_row
+            embed_screenshot_in_cell(f"D{row_idx}", screenshot_val, row_idx)
 
     # Section 8: Suggestions
     write_section("Suggestions")
@@ -747,6 +824,9 @@ def download_task_report_xlsx(task_id: str, db: Session = Depends(get_db)):
                 val_str = val_str[:100]
             max_len = max(max_len, len(val_str))
         ws.column_dimensions[col_letter].width = min(max(max_len + 3, 10), 50)
+
+    # Explicitly set Column D (SCREENSHOT) to a wider size so images fit nicely
+    ws.column_dimensions["D"].width = 55
 
     file_stream = io.BytesIO()
     wb.save(file_stream)
