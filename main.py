@@ -95,7 +95,7 @@ def get_task_with_counts(task: models.Task, db: Session) -> schemas.TaskResponse
     """Helper function to calculate counts for a single task."""
     use_case_count = db.query(func.count(models.UseCase.id)).filter(models.UseCase.task_id == task.id).scalar() or 0
     test_case_count = db.query(func.count(models.TestCase.id)).filter(models.TestCase.task_id == task.id).scalar() or 0
-    error_count = db.query(func.count(models.TestError.id)).filter(models.TestError.task_id == task.id).scalar() or 0
+    error_count = db.query(func.count(models.TestError.id)).filter(models.TestError.task_id == task.id, models.TestError.severity != "passed", models.TestError.severity != "info").scalar() or 0
     suggestion_count = db.query(func.count(models.Suggestion.id)).filter(models.Suggestion.task_id == task.id).scalar() or 0
     
     return schemas.TaskResponse(
@@ -935,7 +935,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     # Task Counts
     total_tasks = db.query(func.count(models.Task.id)).scalar() or 0
     total_test_cases = db.query(func.count(models.TestCase.id)).scalar() or 0
-    total_errors = db.query(func.count(models.TestError.id)).scalar() or 0
+    total_errors = db.query(func.count(models.TestError.id)).filter(models.TestError.severity != "passed", models.TestError.severity != "info").scalar() or 0
     total_suggestions = db.query(func.count(models.Suggestion.id)).scalar() or 0
     
     # Calculate Success Rate

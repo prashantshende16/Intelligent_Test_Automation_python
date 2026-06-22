@@ -670,7 +670,7 @@ def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = N
                     logger.warning(f"Failed to navigate to {current_url}: {exc}")
 
                 actual_url = page.url
-                if actual_url != current_url and same_site(actual_url, normalized):
+                if actual_url.rstrip("/") != current_url.rstrip("/") and same_site(actual_url, normalized):
                     if actual_url.rstrip("/") in visited:
                         continue
                     visited.add(actual_url.rstrip("/"))
@@ -1569,10 +1569,12 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                     log_callback(f"[Orchestrator] Filled detected {role} field at {page.url}.")
 
         submit_selectors = [
-            "button[type='submit']",
-            "input[type='submit']",
+            "button:has-text('LOGIN')",
             "button:has-text('Login')",
             "button:has-text('Sign in')",
+            "button:has-text('Sign In')",
+            "button[type='submit']",
+            "input[type='submit']",
             "button:has-text('Submit')",
             "button:has-text('Verify')",
             "button:has-text('Continue')",
@@ -1944,22 +1946,55 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                     const type = el.getAttribute('type') || 'text';
                     let val = 'QA Test Value';
 
-                    if (labelLower.includes('email') || placeholder.includes('email')) {
-                        val = 'test.qa@datagrid.co.in';
-                    } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
-                        val = 'TestSecure#2026';
-                    } else if (labelLower.includes('phone') || labelLower.includes('mobile') || placeholder.includes('phone') || placeholder.includes('mobile')) {
-                        val = '9876543210';
-                    } else if (labelLower.includes('year') || placeholder.includes('year')) {
-                        val = '2026';
-                    } else if (labelLower.includes('shared on') || labelLower.includes('date') || placeholder.includes('date') || type === 'date') {
-                        val = '2026-06-18';
-                    } else if (labelLower.includes('fund') || placeholder.includes('fund')) {
-                        val = 'PNS Capital Fund A';
-                    } else if (labelLower.includes('company') || placeholder.includes('company')) {
-                        val = 'Datagrid Investment Company';
-                    } else if (labelLower.includes('investor') || placeholder.includes('investor')) {
-                        val = 'QA Investor Group';
+                    const urlLower = window.location.href.toLowerCase();
+                    const isLoginPage = urlLower.includes('login') || urlLower.includes('signin');
+
+                    if (isLoginPage) {
+                        if (labelLower.includes('email') || placeholder.includes('email') || labelLower.includes('username') || placeholder.includes('username') || labelLower.includes('user') || placeholder.includes('user')) {
+                            val = 'admin@gmail.com';
+                        } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
+                            val = 'Admin@#123';
+                        }
+                    } else {
+                        if (labelLower.includes('email') || placeholder.includes('email')) {
+                            val = 'test.qa@datagrid.co.in';
+                        } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
+                            val = 'TestSecure#2026';
+                        } else if (labelLower.includes('phone') || labelLower.includes('mobile') || placeholder.includes('phone') || placeholder.includes('mobile')) {
+                            val = '9876543210';
+                        } else if (labelLower.includes('year') || placeholder.includes('year')) {
+                            val = '2026';
+                        } else if (labelLower.includes('shared on') || labelLower.includes('date') || placeholder.includes('date') || type === 'date') {
+                            val = '2026-06-18';
+                        } else if (labelLower.includes('fund') || placeholder.includes('fund')) {
+                            val = 'PNS Capital Fund A';
+                        } else if (labelLower.includes('company') || placeholder.includes('company')) {
+                            val = 'Datagrid Investment Company';
+                        } else if (labelLower.includes('investor') || placeholder.includes('investor')) {
+                            val = 'QA Investor Group';
+                        } else if (labelLower.includes('department') || placeholder.includes('department') || labelLower.includes('dept') || placeholder.includes('dept')) {
+                            if (labelLower.includes('desc') || placeholder.includes('desc')) {
+                                val = 'This department handles visual, responsive, and performance QA automation testing.';
+                            } else {
+                                val = 'Quality Assurance';
+                            }
+                        } else if (labelLower.includes('description') || placeholder.includes('description') || labelLower.includes('desc') || placeholder.includes('desc')) {
+                            val = 'This is a sample description generated automatically for testing purposes.';
+                        } else if (labelLower.includes('role') || placeholder.includes('role') || labelLower.includes('designation') || placeholder.includes('designation')) {
+                            val = 'Quality Assurance Lead';
+                        } else if (labelLower.includes('address') || placeholder.includes('address')) {
+                            val = '404 Innovation Way, Tech Park';
+                        } else if (labelLower.includes('city') || placeholder.includes('city')) {
+                            val = 'Mumbai';
+                        } else if (labelLower.includes('state') || placeholder.includes('state')) {
+                            val = 'Maharashtra';
+                        } else if (labelLower.includes('zip') || placeholder.includes('zip') || labelLower.includes('pin') || placeholder.includes('pin') || labelLower.includes('postal') || placeholder.includes('postal')) {
+                            val = '400001';
+                        } else if (labelLower.includes('name') || placeholder.includes('name')) {
+                            val = 'QA Test User';
+                        } else if (labelLower.includes('url') || placeholder.includes('url') || labelLower.includes('link') || placeholder.includes('link')) {
+                            val = 'https://pns-capital.datagrid.co.in';
+                        }
                     }
 
                     setInputValue(el, val);
@@ -1980,6 +2015,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
 
                 const customDropdowns = [];
                 document.querySelectorAll('[role="combobox"], [class*="select-container"], [class*="Select-container"], [class*="-control"], .select, .dropdown').forEach(el => {
+                    if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+                        return;
+                    }
                     const style = window.getComputedStyle(el);
                     if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) {
                         return;
@@ -2046,7 +2084,13 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                 import json
                 json_str = json.dumps(filled_data)
                 
-                test_data["steps"] = f"1. Open the form page.\\n2. Populate the fields with dummy values using Playwright:\\nJSON_DUMMY_DATA: {json_str}"
+                dummy_list = []
+                for k, v in filled_data.items():
+                    if k.lower() != "_token":
+                        dummy_list.append(f"   - {k}: {v}")
+                dummy_list_str = "\\n".join(dummy_list)
+                
+                test_data["steps"] = f"1. Open the form page.\\n2. Populate the fields with dummy values using Playwright:\\n{dummy_list_str}\\n\\nJSON_DUMMY_DATA: {json_str}"
                 
             except Exception as js_err:
                 logger.error(f"Autofill script error: {js_err}")
@@ -2153,7 +2197,11 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
         # Legacy/Gemini tests without check_type — validate keywords against live page
         title_lower = test_data.get("title", "").lower()
         if "required field" in title_lower:
-            return run_test_validation(page, context, {**test_data, "check_type": "form_required"}, profile, auth=auth)
+            temp_data = {**test_data, "check_type": "form_required"}
+            res = run_test_validation(page, context, temp_data, profile, auth=auth)
+            if "steps" in temp_data:
+                test_data["steps"] = temp_data["steps"]
+            return res
         if "navigation" in title_lower or "link" in title_lower:
             if not profile["links"]:
                 return run_test_validation(page, context, {**test_data, "check_type": "navigation_presence"}, profile, auth=auth)
@@ -2357,15 +2405,15 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                         db.commit()
                         db.refresh(test_case)
 
-                    if actual_status == "failed" and test_case:
+                    if test_case:
                         screenshot_name = f"{slugify(use_case_titles.get(use_case_id, 'use_case'))}_{slugify(tc_title)}.png"
                         screenshot_path = os.path.join(screenshot_dir, screenshot_name)
                         save_screenshot(page, screenshot_path)
                         test_error = TestError(
                             task_id=task_id,
                             test_case_id=test_case.id,
-                            message=actual_error or "Validation failed during execution.",
-                            severity=severity_val or (test_data.get("severity") if isinstance(test_data, dict) else "medium") or "medium",
+                            message=actual_error or ("Validation passed successfully." if actual_status == "passed" else "Validation failed during execution."),
+                            severity="passed" if actual_status == "passed" else (severity_val or (test_data.get("severity") if isinstance(test_data, dict) else "medium") or "medium"),
                             page_url=page_url,
                             screenshot_path=screenshot_path
                         )
