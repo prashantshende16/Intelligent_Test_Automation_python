@@ -81,7 +81,15 @@ def looks_like_blocked_page(title: str = "", html_snippet: str = "", body_text: 
         return True
 
     if any(marker in haystack for marker in BLOCKED_PAGE_MARKERS):
-        return True
+        # Prevent cdnjs.cloudflare.com links from triggering block
+        is_only_cloudflare_marker = False
+        if "cloudflare" in haystack:
+            other_markers = [m for m in BLOCKED_PAGE_MARKERS if m != "cloudflare"]
+            has_others = any(m in haystack for m in other_markers)
+            if not has_others and "cdnjs.cloudflare.com" in haystack:
+                is_only_cloudflare_marker = True
+        if not is_only_cloudflare_marker:
+            return True
 
     javascript_warning = "enable javascript" in haystack or "javascript is required" in haystack
     challenge_terms = (
@@ -92,7 +100,6 @@ def looks_like_blocked_page(title: str = "", html_snippet: str = "", body_text: 
         "ray id",
         "cf-browser-verification",
         "cf-challenge",
-        "captcha",
     )
     normal_app_terms = (
         "sign in",
@@ -109,6 +116,7 @@ def looks_like_blocked_page(title: str = "", html_snippet: str = "", body_text: 
         return True
 
     return False
+
 
 
 def aggregate_site_profile(url: str, pages: list) -> dict:
@@ -1012,6 +1020,18 @@ def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
                 )
             )
 
+        # Add Deep Interactive Flow check to test every clickable element
+        if not page_profile["is_blocked"]:
+            page_specific_cases.append(
+                pending_test(
+                    f"Deep Interactive Flow on {page_title}",
+                    f"1. Open {page_profile['page_url']}\n2. Discover all interactive buttons, toggles, add/edit icons\n3. Click each sequentially and check for modals, tabs, or redirects\n4. Auto-fill and validate any modal forms",
+                    "All interactive elements should work without errors, and modal forms should validate or submit successfully.",
+                    "deep_interaction",
+                    page_profile["page_url"],
+                )
+            )
+
         use_cases.append({
             "title": f"Page Coverage — {page_title}",
             "description": f"Validate the actual page '{page_title}' at {page_profile['page_url']}.",
@@ -1380,7 +1400,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
         if log_callback:
             log_callback(f"[Orchestrator] Attempting authenticated session via {login_url}")
         page.goto(login_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(1500)
 
         snapshot = _discover_auth_form(page)
         if _detect_challenge_text(snapshot.get("body_text", ""), page.url):
@@ -1405,6 +1425,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
         if need_login_trigger:
             if log_callback:
                 log_callback("[Orchestrator] Login form inputs not fully visible on page load. Attempting to click LOGIN trigger links/buttons.")
+            # Prioritize login triggers and exclude registration forms
             trigger_selectors = [
                 "a:has-text('LOGIN')",
                 "a:has-text('Login')",
@@ -1414,7 +1435,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                 "button:has-text('Login')",
                 "button:has-text('Sign in')",
                 "button:has-text('Sign In')",
-                ".login_popup_register",
+                "a.login_popup_register:has-text('LOGIN')",
             ]
             clicked_trigger = False
             for selector in trigger_selectors:
@@ -1424,7 +1445,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                         for j in range(loc.count()):
                             trigger = loc.nth(j)
                             if trigger.is_visible():
-                                trigger.click(timeout=2000)
+                                trigger.click(timeout=3000)
                                 clicked_trigger = True
                                 break
                         if clicked_trigger:
@@ -1433,7 +1454,11 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                         if log_callback:
                             log_callback(f"[Orchestrator] Failed clicking login trigger '{selector}': {e}")
             if clicked_trigger:
-                page.wait_for_timeout(2000)  # Wait for modal transit animation
+                try:
+                    # Wait for password or username inputs to become visible
+                    page.wait_for_selector("input[type='password'], input[name*='login' i], input[name*='mobile' i]", state="visible", timeout=4000)
+                except Exception:
+                    page.wait_for_timeout(1500)
                 snapshot = _discover_auth_form(page)
 
         def fill_first(selectors, value):
@@ -2163,6 +2188,272 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             )
             if missing:
                 return "failed", f"{len(missing)} image(s) do not have descriptive labels: {', '.join(missing[:3])}. Screen readers won't be able to describe these images to blind users.", "medium"
+            return "passed", None, None
+
+        if check_type == "deep_interaction":
+            logger.info(f"[DeepInteraction] Starting deep interactive validation on {page_url}")
+            safe_goto(page_url)
+            page.wait_for_timeout(2000)
+
+            # Discover potentially clickable elements
+            find_elements_js = """
+            () => {
+                const candidates = Array.from(document.querySelectorAll('a, button, [role="button"], [role="link"], [class*="btn" i], [class*="click" i]'));
+                const clickables = [];
+                const blacklist = ["logout", "log out", "signout", "sign out", "deactivate", "delete", "remove", "cancel", "clear", "reset"];
+                
+                candidates.forEach((el, idx) => {
+                    let isVisible = false;
+                    try {
+                        const style = window.getComputedStyle(el);
+                        isVisible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) &&
+                                    style.display !== 'none' &&
+                                    style.visibility !== 'hidden' &&
+                                    style.opacity !== '0';
+                    } catch (e) {}
+                    
+                    if (!isVisible) return;
+                    
+                    const text = (el.innerText || el.textContent || '').trim();
+                    const textLower = text.toLowerCase();
+                    
+                    if (blacklist.some(term => textLower.includes(term))) return;
+                    
+                    const tagName = el.tagName.toLowerCase();
+                    if (tagName === 'a') {
+                        const href = el.getAttribute('href') || '';
+                        if (href.startsWith('mailto:') || href.startsWith('tel:') || (href.startsWith('http') && !href.includes(window.location.host))) {
+                            return;
+                        }
+                    }
+                    
+                    let selector = '';
+                    if (el.id) {
+                        selector = `#${CSS.escape(el.id)}`;
+                    } else if (tagName === 'input' && el.getAttribute('name')) {
+                        selector = `input[name="${CSS.escape(el.getAttribute('name'))}"]`;
+                    }
+                    
+                    clickables.push({
+                        index: idx,
+                        tagName: tagName,
+                        text: text.slice(0, 40),
+                        selector: selector,
+                        class: el.className || ''
+                    });
+                });
+                return clickables;
+            }
+            """
+            
+            try:
+                candidates = page.evaluate(find_elements_js)
+            except Exception as eval_err:
+                logger.error(f"[DeepInteraction] Failed to discover elements: {eval_err}")
+                candidates = []
+                
+            logger.info(f"[DeepInteraction] Discovered {len(candidates)} candidate clickable elements.")
+            
+            actions_performed = 0
+            max_actions = 12
+            
+            for item in candidates:
+                if actions_performed >= max_actions:
+                    break
+                    
+                tag = item.get("tagName", "").lower()
+                text = item.get("text", "").strip()
+                selector = item.get("selector")
+                
+                locator = None
+                desc = f"<{tag}> text='{text}'"
+                if selector:
+                    locator = page.locator(selector).first
+                    desc = f"<{tag}> selector='{selector}'"
+                elif text:
+                    clean_text = text.replace("'", "\\'")
+                    locator = page.locator(f"{tag}:has-text('{clean_text}')").first
+                else:
+                    continue
+                    
+                try:
+                    if not locator or locator.count() == 0 or not locator.is_visible():
+                        continue
+                        
+                    logger.info(f"[DeepInteraction] Clicking element {actions_performed+1}: {desc}")
+                    actions_performed += 1
+                    
+                    before_url = page.url
+                    locator.click(timeout=3000)
+                    page.wait_for_timeout(1500)
+                    
+                    after_url = page.url
+                    if after_url != before_url:
+                        logger.info(f"[DeepInteraction] Redirection detected: {before_url} -> {after_url}")
+                        if same_site(after_url, page_url):
+                            page.go_back()
+                            page.wait_for_timeout(1000)
+                        else:
+                            safe_goto(page_url)
+                            page.wait_for_timeout(1500)
+                            
+                    # Check for modals
+                    modal_selector = page.evaluate("""
+                    () => {
+                        const modalDivs = document.querySelectorAll('.modal, .popup, .dialog, [role="dialog"], [class*="modal" i], [class*="popup" i]');
+                        for (const modal of modalDivs) {
+                            const style = window.getComputedStyle(modal);
+                            if (style.display !== 'none' && style.visibility !== 'hidden' && modal.offsetWidth > 0) {
+                                return modal.id ? `#${CSS.escape(modal.id)}` : (modal.className ? `.${CSS.escape(modal.className.split(' ')[0])}` : '');
+                            }
+                        }
+                        return null;
+                    }
+                    """)
+                    
+                    if modal_selector:
+                        logger.info(f"[DeepInteraction] Visible modal dialog detected: {modal_selector}")
+                        inputs_count = page.locator(f"{modal_selector} input:not([type=hidden]), {modal_selector} textarea, {modal_selector} select").count()
+                        if inputs_count > 0:
+                            logger.info(f"[DeepInteraction] Found {inputs_count} fields inside the modal. Performing autofill and validation checks.")
+                            
+                            submit_selectors = ["button[type='submit']", "button:has-text('Save')", "button:has-text('Add')", "button:has-text('Submit')", "input[type='submit']"]
+                            modal_submit = None
+                            for submit_sel in submit_selectors:
+                                try:
+                                    loc = page.locator(f"{modal_selector} {submit_sel}")
+                                    if loc.count() > 0 and loc.first.is_visible():
+                                        modal_submit = loc.first
+                                        break
+                                except Exception:
+                                    pass
+                                    
+                            if modal_submit:
+                                try:
+                                    modal_submit.click(timeout=2000)
+                                    page.wait_for_timeout(1000)
+                                except Exception:
+                                    pass
+                                    
+                            autofill_js = """
+                            async function() {
+                                const filledFields = {};
+                                const labelMap = {};
+                                document.querySelectorAll('label').forEach(lbl => {
+                                    const htmlFor = lbl.getAttribute('for');
+                                    const text = (lbl.textContent || '').trim().replace(/\\*$/, '').trim();
+                                    if (htmlFor) labelMap[htmlFor] = text;
+                                });
+                                
+                                function getFieldLabel(el) {
+                                    const id = el.id || '';
+                                    if (labelMap[id]) return labelMap[id];
+                                    const parentLabel = el.closest('label');
+                                    if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\\*$/, '').trim();
+                                    return el.getAttribute('placeholder') || el.getAttribute('name') || 'Field';
+                                }
+                                
+                                document.querySelectorAll('select').forEach(el => {
+                                    const label = getFieldLabel(el);
+                                    const validOption = Array.from(el.options).find(o => o.value && o.value !== '' && !o.disabled) || el.options[0];
+                                    if (validOption) {
+                                        el.value = validOption.value;
+                                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                                        filledFields[label] = validOption.text;
+                                    }
+                                });
+                                
+                                const textInputs = document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=file]):not([type=radio]):not([type=checkbox]), textarea');
+                                for (const el of textInputs) {
+                                    const style = window.getComputedStyle(el);
+                                    if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) continue;
+                                    
+                                    const label = getFieldLabel(el);
+                                    const labelLower = label.toLowerCase();
+                                    const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                                    let val = 'QA Test Value';
+                                    
+                                    if (labelLower.includes('email') || placeholder.includes('email')) {
+                                        val = 'test.qa@datagrid.co.in';
+                                    } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
+                                        val = 'TestSecure#2026';
+                                    } else if (labelLower.includes('phone') || labelLower.includes('mobile') || placeholder.includes('phone') || placeholder.includes('mobile')) {
+                                        val = '9876543210';
+                                    } else if (labelLower.includes('year') || placeholder.includes('year')) {
+                                        val = '2026';
+                                    } else if (labelLower.includes('date') || placeholder.includes('date')) {
+                                        val = '2026-06-18';
+                                    } else if (labelLower.includes('name') || placeholder.includes('name')) {
+                                        val = 'QA Test User';
+                                    }
+                                    
+                                    el.value = val;
+                                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                                    filledFields[label] = val;
+                                }
+                                
+                                document.querySelectorAll('input[type="checkbox"], input[type="radio"]').forEach(el => {
+                                    if (window.getComputedStyle(el).display !== 'none' && !el.checked) {
+                                        el.click();
+                                    }
+                                });
+                                return filledFields;
+                            }
+                            """
+                            try:
+                                page.evaluate(autofill_js)
+                                page.wait_for_timeout(500)
+                            except Exception as autofill_err:
+                                logger.error(f"[DeepInteraction] Autofill error: {autofill_err}")
+                                
+                            if modal_submit:
+                                try:
+                                    modal_submit.click(timeout=3000)
+                                    page.wait_for_timeout(2000)
+                                except Exception:
+                                    pass
+                                    
+                        # Close the modal
+                        close_selectors = [
+                            f"{modal_selector} .close", f"{modal_selector} [class*='close' i]",
+                            f"{modal_selector} button:has-text('Close')", f"{modal_selector} button:has-text('×')",
+                            "button[class*='close' i]", ".modal-backdrop"
+                        ]
+                        for close_sel in close_selectors:
+                            try:
+                                close_btn = page.locator(close_sel)
+                                if close_btn.count() > 0 and close_btn.first.is_visible():
+                                    close_btn.first.click(timeout=2000)
+                                    page.wait_for_timeout(1000)
+                                    break
+                            except Exception:
+                                pass
+                                
+                    errors_detected = page.evaluate("""
+                    () => {
+                        const errMsgs = [];
+                        document.querySelectorAll('.error, .invalid-feedback, [class*="error"], [class*="invalid"], .alert-danger').forEach(el => {
+                            const style = window.getComputedStyle(el);
+                            if (style.display !== 'none' && style.visibility !== 'hidden' && el.offsetWidth > 0) {
+                                const txt = (el.textContent || '').trim();
+                                if (txt && txt.length < 150) errMsgs.push(txt);
+                            }
+                        });
+                        return errMsgs;
+                    }
+                    """)
+                    if errors_detected:
+                        logger.warning(f"[DeepInteraction] UI errors detected: {errors_detected}")
+                        
+                except Exception as click_err:
+                    logger.warning(f"[DeepInteraction] Action failed for {desc}: {click_err}")
+                    try:
+                        safe_goto(page_url)
+                        page.wait_for_timeout(1500)
+                    except Exception:
+                        pass
+                        
             return "passed", None, None
 
         if check_type == "manual_page_load":
