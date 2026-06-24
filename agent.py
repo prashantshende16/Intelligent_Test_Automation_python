@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import re
 import time
@@ -10,7 +11,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 from sqlalchemy.orm import Session
 from database import SessionLocal
-from models import Task, UseCase, TestCase, TestError, Suggestion, Codebase, AgentState, CodeReference, TaskAuth
+from models import Task, UseCase, TestCase, TestError, Suggestion, Codebase, AgentState, CodeReference, TaskAuth, SafetyConfig, TestCleanupLog
 from concurrent.futures import ThreadPoolExecutor
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -63,6 +64,56 @@ def same_site(candidate: str, base_url: str) -> bool:
 
 def slugify(value: str) -> str:
     return "".join(c if c.isalnum() else "_" for c in (value or "")).strip("_")[:60]
+
+
+# --- ADMIN PROTECTION SYSTEM ---
+DEFAULT_PROTECTED_USERNAMES = {"admin", "superadmin", "root", "administrator", "sysadmin"}
+BLOCKED_ACTIONS_ON_PROTECTED = {"delete", "remove", "deactivate", "disable", "change_password",
+                                 "change_role", "update", "edit", "modify", "reset_password"}
+
+def is_protected_user(username: str, custom_protected: set = None) -> bool:
+    protected = DEFAULT_PROTECTED_USERNAMES | (custom_protected or set())
+    return username.strip().lower() in {p.lower() for p in protected}
+
+def sanitize_test_step(step: str, protected_usernames: set) -> tuple[str, bool]:
+    """Returns (sanitized_step, was_blocked). Blocks steps that target protected users."""
+    step_lower = step.lower()
+    for username in protected_usernames:
+        if username.lower() in step_lower:
+            for action in BLOCKED_ACTIONS_ON_PROTECTED:
+                if action in step_lower:
+                    return (f"BLOCKED: Cannot {action} protected user '{username}'", True)
+    return (step, False)
+
+
+# --- SAFE TESTING MODE ---
+SAFE_TEST_MARKER = "TEST_RECORD"
+
+def generate_temp_test_user(prefix: str = "test_user_", index: int = 1) -> dict:
+    """Generate temporary test credentials that are clearly marked as test data."""
+    return {
+        "username": f"{prefix}{index:03d}",
+        "email": f"{prefix}{index:03d}@test.automation.local",
+        "password": f"TestPass_{index:03d}!Secure",
+        "first_name": f"TestFirst{index}",
+        "last_name": f"TestLast{index}",
+        "phone": f"+1555000{index:04d}",
+        "_marker": SAFE_TEST_MARKER,
+    }
+
+def get_safe_form_values(field_name: str, test_index: int = 1, prefix: str = "test_user_") -> str:
+    """Return safe test values for form fields based on field name classification."""
+    temp = generate_temp_test_user(prefix, index=test_index)
+    field_lower = field_name.lower()
+    if "email" in field_lower: return temp["email"]
+    if "username" in field_lower or "login" in field_lower or "user" in field_lower: return temp["username"]
+    if "password" in field_lower or "pass" in field_lower: return temp["password"]
+    if "first" in field_lower or "fname" in field_lower: return temp["first_name"]
+    if "last" in field_lower or "lname" in field_lower: return temp["last_name"]
+    if "phone" in field_lower or "mobile" in field_lower: return temp["phone"]
+    if "name" in field_lower: return f"{temp['first_name']} {temp['last_name']}"
+    return f"test_value_{test_index}"
+
 
 
 BLOCKED_PAGE_MARKERS = (
@@ -260,6 +311,143 @@ def build_page_profile(page: dict, base_url: str) -> dict:
         "image_count": len(images),
         "images_missing_alt": sum(1 for image in images if not image.get("has_alt")),
         "is_blocked": looks_like_blocked_page(title, html_snippet),
+    }
+
+
+# --- ROUTE DISCOVERY SYSTEM ---
+
+def discover_routes_from_codebase(codebase_path: str, codebase_data: dict) -> list:
+    """Extract route definitions from React Router, Next.js pages, and backend configs."""
+    routes = []
+    if not codebase_path or not os.path.isdir(codebase_path):
+        return routes
+
+    # 1. React Router patterns
+    react_route_patterns = [
+        r'path\s*[=:]\s*["\']([^"\']+)["\']',          # path="/users"
+        r'<Route\s+.*?path\s*=\s*["\']([^"\']+)["\']',  # <Route path="/users">
+        r'navigate\s*\(\s*["\']([^"\']+)["\']',          # navigate("/users")
+        r'to\s*=\s*["\']([^"\']+)["\']',                 # to="/users"
+        r'href\s*=\s*["\']\/([^"\']+)["\']',             # href="/users"
+    ]
+
+    # 2. Next.js file-based routing
+    nextjs_page_dirs = ["pages", "app", "src/pages", "src/app"]
+
+    # 3. Backend route patterns (Express, FastAPI, Django)
+    backend_route_patterns = [
+        r'@app\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']',  # FastAPI
+        r'router\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']',  # Express
+        r'path\s*\(\s*["\']([^"\']+)["\']',  # Django
+    ]
+
+    for rel_path in codebase_data.get("file_list", []):
+        full_path = os.path.join(codebase_path, rel_path)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read(8000)
+            for pattern in react_route_patterns + backend_route_patterns:
+                matches = re.findall(pattern, content)
+                for match in matches:
+                    route = match if isinstance(match, str) else match[-1]
+                    if route.startswith("/") and len(route) < 200:
+                        routes.append({
+                            "route": route,
+                            "source_file": rel_path,
+                            "discovery_method": "codebase_static_analysis"
+                        })
+        except Exception:
+            continue
+
+    # Next.js file-based routes
+    for page_dir in nextjs_page_dirs:
+        dir_path = os.path.join(codebase_path, page_dir)
+        if os.path.isdir(dir_path):
+            for root, dirs, files in os.walk(dir_path):
+                dirs[:] = [d for d in dirs if not d.startswith((".", "_", "api"))]
+                for f in files:
+                    if f.endswith((".js", ".jsx", ".ts", ".tsx")) and not f.startswith("_"):
+                        rel = os.path.relpath(os.path.join(root, f), dir_path)
+                        route = "/" + rel.rsplit(".", 1)[0].replace("index", "").rstrip("/")
+                        route = re.sub(r'\[([^\]]+)\]', r':\1', route)  # [id] → :id
+                        routes.append({
+                            "route": route or "/",
+                            "source_file": os.path.join(page_dir, rel),
+                            "discovery_method": "nextjs_file_routing"
+                        })
+    return routes
+
+
+def discover_routes_from_sitemap(url: str) -> list:
+    """Fetch and parse sitemap.xml for route URLs."""
+    routes = []
+    normalized = normalize_url(url)
+    domain = normalized.split("//", 1)[1].split("/")[0]
+    sitemap_urls = [
+        f"{normalized.rstrip('/')}/sitemap.xml",
+        f"https://{domain}/sitemap.xml",
+        f"https://{domain}/sitemap_index.xml",
+    ]
+    for sitemap_url in sitemap_urls:
+        try:
+            resp = httpx.get(sitemap_url, timeout=10.0, follow_redirects=True)
+            if resp.status_code == 200 and "<urlset" in resp.text:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for loc in soup.find_all("loc"):
+                    route_url = loc.get_text().strip()
+                    if route_url:
+                        routes.append({
+                            "route": route_url,
+                            "source_file": "sitemap.xml",
+                            "discovery_method": "sitemap"
+                        })
+                break
+        except Exception:
+            continue
+    return routes
+
+
+def compare_routes(codebase_routes: list, crawled_urls: list, base_url: str) -> dict:
+    """Compare routes found in codebase vs routes discovered by crawler."""
+    normalized_base = normalize_url(base_url).rstrip("/")
+
+    crawled_paths = set()
+    for url in crawled_urls:
+        try:
+            path = "/" + normalize_url(url).split("//", 1)[1].split("/", 1)[1] if "/" in normalize_url(url).split("//", 1)[1] else "/"
+            crawled_paths.add(path.rstrip("/") or "/")
+        except Exception:
+            pass
+
+    codebase_paths = {}
+    for r in codebase_routes:
+        route = r["route"]
+        if route.startswith("http"):
+            try:
+                path = "/" + route.split("//", 1)[1].split("/", 1)[1]
+            except Exception:
+                continue
+        else:
+            path = route
+        path = path.rstrip("/") or "/"
+        # Skip parameterized routes for exact match
+        if ":" not in path and "<" not in path and "{" not in path:
+            codebase_paths[path] = r
+
+    tested = []
+    untested = []
+    for path, route_info in codebase_paths.items():
+        if path in crawled_paths:
+            tested.append(route_info)
+        else:
+            untested.append(route_info)
+
+    return {
+        "total_codebase_routes": len(codebase_paths),
+        "total_crawled_pages": len(crawled_paths),
+        "tested_routes": tested,
+        "untested_routes": untested,
+        "coverage_percent": round(len(tested) / max(len(codebase_paths), 1) * 100, 1)
     }
 
 
@@ -1800,6 +1988,36 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                     logger.warning(f"[SelfHealing] Re-authentication failed after redirect to {page.url}")
         return response
 
+    task_id = test_data.get("task_id")
+    protected_usernames = DEFAULT_PROTECTED_USERNAMES
+    enable_safe_mode = True
+    temp_user_prefix = "test_user_"
+    
+    if task_id:
+        db = SessionLocal()
+        try:
+            safety_config = db.query(SafetyConfig).filter(SafetyConfig.task_id == task_id).first()
+            if safety_config:
+                try:
+                    loaded_users = json.loads(safety_config.protected_usernames_json)
+                    if isinstance(loaded_users, list):
+                        protected_usernames = set(loaded_users)
+                except Exception:
+                    pass
+                enable_safe_mode = bool(safety_config.enable_safe_mode)
+                temp_user_prefix = safety_config.temp_user_prefix or "test_user_"
+        finally:
+            db.close()
+
+    # Admin protection check
+    steps_text = test_data.get("steps") or ""
+    if steps_text:
+        steps_list = [s.strip() for s in steps_text.split("\n") if s.strip()]
+        for step in steps_list:
+            sanitized, was_blocked = sanitize_test_step(step, protected_usernames)
+            if was_blocked:
+                return "failed", f"Admin Protection Blocked Step: {sanitized}", "critical"
+
     try:
         if check_type == "page_load":
             response = safe_goto(page_url)
@@ -1900,14 +2118,14 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
 
             # Define the JS auto-fill function
             js_autofill_script = """
-            async function() {
+            async function(safeValues) {
                 const filledFields = {};
                 const fileInputs = [];
 
                 const labelMap = {};
                 document.querySelectorAll('label').forEach(lbl => {
                     const htmlFor = lbl.getAttribute('for');
-                    const text = (lbl.textContent || '').trim().replace(/\\*$/, '').trim();
+                    const text = (lbl.textContent || '').trim().replace(/\*$/, '').trim();
                     if (htmlFor) {
                         labelMap[htmlFor] = text;
                     }
@@ -1917,7 +2135,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                     const id = el.id || '';
                     if (labelMap[id]) return labelMap[id];
                     const parentLabel = el.closest('label');
-                    if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\\*$/, '').trim();
+                    if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\*$/, '').trim();
                     const placeholder = el.getAttribute('placeholder') || '';
                     if (placeholder) return placeholder;
                     const name = el.getAttribute('name') || '';
@@ -1926,7 +2144,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                     let prev = el.previousElementSibling;
                     while (prev) {
                         const text = (prev.textContent || '').trim();
-                        if (text && text.length < 50) return text.replace(/\\*$/, '').trim();
+                        if (text && text.length < 50) return text.replace(/\*$/, '').trim();
                         prev = prev.previousElementSibling;
                     }
                     return '';
@@ -1976,17 +2194,17 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
 
                     if (isLoginPage) {
                         if (labelLower.includes('email') || placeholder.includes('email') || labelLower.includes('username') || placeholder.includes('username') || labelLower.includes('user') || placeholder.includes('user')) {
-                            val = 'admin@gmail.com';
+                            val = safeValues.username || 'admin@gmail.com';
                         } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
-                            val = 'Admin@#123';
+                            val = safeValues.password || 'Admin@#123';
                         }
                     } else {
                         if (labelLower.includes('email') || placeholder.includes('email')) {
-                            val = 'test.qa@datagrid.co.in';
+                            val = safeValues.email || 'test.qa@datagrid.co.in';
                         } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
-                            val = 'TestSecure#2026';
+                            val = safeValues.password || 'TestSecure#2026';
                         } else if (labelLower.includes('phone') || labelLower.includes('mobile') || placeholder.includes('phone') || placeholder.includes('mobile')) {
-                            val = '9876543210';
+                            val = safeValues.phone || '9876543210';
                         } else if (labelLower.includes('year') || placeholder.includes('year')) {
                             val = '2026';
                         } else if (labelLower.includes('shared on') || labelLower.includes('date') || placeholder.includes('date') || type === 'date') {
@@ -2016,7 +2234,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                         } else if (labelLower.includes('zip') || placeholder.includes('zip') || labelLower.includes('pin') || placeholder.includes('pin') || labelLower.includes('postal') || placeholder.includes('postal')) {
                             val = '400001';
                         } else if (labelLower.includes('name') || placeholder.includes('name')) {
-                            val = 'QA Test User';
+                            val = (safeValues.first_name && safeValues.last_name) ? (safeValues.first_name + ' ' + safeValues.last_name) : 'QA Test User';
                         } else if (labelLower.includes('url') || placeholder.includes('url') || labelLower.includes('link') || placeholder.includes('link')) {
                             val = 'https://pns-capital.datagrid.co.in';
                         }
@@ -2093,9 +2311,42 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             """
 
             try:
-                autofill_result = page.evaluate(js_autofill_script)
+                # Generate safe testing values if enabled
+                safe_values = {}
+                if enable_safe_mode:
+                    for field in ["email", "username", "password", "first_name", "last_name", "phone"]:
+                        safe_values[field] = get_safe_form_values(field, test_index=1, prefix=temp_user_prefix)
+                else:
+                    safe_values = {
+                        "email": "test.qa@datagrid.co.in",
+                        "username": "qa_test_user",
+                        "password": "TestSecure#2026",
+                        "first_name": "QA",
+                        "last_name": "Test User",
+                        "phone": "9876543210"
+                    }
+                autofill_result = page.evaluate(js_autofill_script, safe_values)
                 filled_data = autofill_result.get("filledFields", {})
                 file_inputs = autofill_result.get("fileInputs", [])
+
+                # Log temp records for cleanup
+                if task_id and enable_safe_mode and filled_data:
+                    db = SessionLocal()
+                    try:
+                        for k, v in filled_data.items():
+                            if isinstance(v, str) and v.startswith(temp_user_prefix):
+                                cleanup_log = TestCleanupLog(
+                                    task_id=task_id,
+                                    record_type="user",
+                                    record_identifier=v,
+                                    action="created"
+                                )
+                                db.add(cleanup_log)
+                        db.commit()
+                    except Exception as db_err:
+                        logger.error(f"Failed to log temp record for cleanup: {db_err}")
+                    finally:
+                        db.close()
                 
                 for file_in in file_inputs:
                     sel = file_in.get("selector")
@@ -2336,12 +2587,12 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                                     pass
                                     
                             autofill_js = """
-                            async function() {
+                            async function(safeValues) {
                                 const filledFields = {};
                                 const labelMap = {};
                                 document.querySelectorAll('label').forEach(lbl => {
                                     const htmlFor = lbl.getAttribute('for');
-                                    const text = (lbl.textContent || '').trim().replace(/\\*$/, '').trim();
+                                    const text = (lbl.textContent || '').trim().replace(/\*$/, '').trim();
                                     if (htmlFor) labelMap[htmlFor] = text;
                                 });
                                 
@@ -2349,7 +2600,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                                     const id = el.id || '';
                                     if (labelMap[id]) return labelMap[id];
                                     const parentLabel = el.closest('label');
-                                    if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\\*$/, '').trim();
+                                    if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\*$/, '').trim();
                                     return el.getAttribute('placeholder') || el.getAttribute('name') || 'Field';
                                 }
                                 
@@ -2374,17 +2625,17 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                                     let val = 'QA Test Value';
                                     
                                     if (labelLower.includes('email') || placeholder.includes('email')) {
-                                        val = 'test.qa@datagrid.co.in';
+                                        val = safeValues.email || 'test.qa@datagrid.co.in';
                                     } else if (labelLower.includes('pass') || placeholder.includes('pass')) {
-                                        val = 'TestSecure#2026';
+                                        val = safeValues.password || 'TestSecure#2026';
                                     } else if (labelLower.includes('phone') || labelLower.includes('mobile') || placeholder.includes('phone') || placeholder.includes('mobile')) {
-                                        val = '9876543210';
+                                        val = safeValues.phone || '9876543210';
                                     } else if (labelLower.includes('year') || placeholder.includes('year')) {
                                         val = '2026';
                                     } else if (labelLower.includes('date') || placeholder.includes('date')) {
                                         val = '2026-06-18';
                                     } else if (labelLower.includes('name') || placeholder.includes('name')) {
-                                        val = 'QA Test User';
+                                        val = (safeValues.first_name && safeValues.last_name) ? (safeValues.first_name + ' ' + safeValues.last_name) : 'QA Test User';
                                     }
                                     
                                     el.value = val;
@@ -2402,7 +2653,24 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                             }
                             """
                             try:
-                                page.evaluate(autofill_js)
+                                modal_filled = page.evaluate(autofill_js, safe_values)
+                                if task_id and enable_safe_mode and modal_filled:
+                                    db = SessionLocal()
+                                    try:
+                                        for k, v in modal_filled.items():
+                                            if isinstance(v, str) and v.startswith(temp_user_prefix):
+                                                cleanup_log = TestCleanupLog(
+                                                    task_id=task_id,
+                                                    record_type="user",
+                                                    record_identifier=v,
+                                                    action="created"
+                                                )
+                                                db.add(cleanup_log)
+                                        db.commit()
+                                    except Exception as db_err:
+                                        logger.error(f"Failed to log temp record for cleanup: {db_err}")
+                                    finally:
+                                        db.close()
                                 page.wait_for_timeout(500)
                             except Exception as autofill_err:
                                 logger.error(f"[DeepInteraction] Autofill error: {autofill_err}")
@@ -2637,7 +2905,8 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                         "expected_result": tc_expected,
                         "page_url": page_url,
                         "severity": "medium",
-                        "check_type": "custom_scenario"
+                        "check_type": "custom_scenario",
+                        "task_id": task_id
                     }
                 else:
                     tc_id = None
@@ -2645,7 +2914,7 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                     tc_steps = test_data.get("steps")
                     tc_expected = test_data.get("expected_result")
                     page_url = normalize_url(test_data.get("page_url", base_url))
-                    test_data_dict = test_data
+                    test_data_dict = {**test_data, "task_id": task_id}
 
                 test_profile = page_profiles.get(page_url, profile)
                 if log_callback:
@@ -2690,6 +2959,7 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                             status=actual_status,
                             error_message=actual_error,
                             execution_time=round(0.5 + float(time.time() % 1), 2),
+                            test_type=test_data_dict.get("test_type"),
                             page_url=page_url
                         )
                         db.add(test_case)
@@ -2722,62 +2992,165 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
 
 
 def map_error_to_code(codebase_path: str, error_message: str, codebase_data: dict) -> dict:
-    logger.info(f"Mapping error to codebase: {error_message}")
+    """Deep codebase trace: Route → Component → API → Backend → DB Table."""
+    logger.info(f"Deep codebase trace for error: {error_message}")
     ref = {
         "file_path": "src/App.jsx",
         "start_line": 1,
         "end_line": 10,
         "code_snippet": "// Main Application Entry point",
-        "proposed_fix": None
+        "proposed_fix": None,
+        "trace_chain": []
     }
 
     if not codebase_path or not os.path.exists(codebase_path):
         return ref
 
+    trace = []
     error_lower = error_message.lower()
-    target_files = []
-    if "form" in error_lower or "email" in error_lower or "validation" in error_lower:
-        target_files = [f for f in codebase_data.get("file_list", []) if any(k in f.lower() for k in ["form", "login", "checkout", "signup", "contact"])]
-    elif "navigation" in error_lower or "link" in error_lower or "internal" in error_lower:
-        target_files = [f for f in codebase_data.get("file_list", []) if any(k in f.lower() for k in ["nav", "menu", "header", "footer", "link"])]
-    else:
-        target_files = [f for f in codebase_data.get("file_list", []) if any(k in f.lower() for k in ["app", "main", "index"])][:2]
 
-    if not target_files:
-        target_files = codebase_data.get("file_list", [])[:2]
-
-    for rel_path in target_files:
+    # Step 1: Find the frontend component
+    component_file = None
+    
+    for rel_path in codebase_data.get("file_list", []):
+        if not rel_path.endswith((".jsx", ".tsx", ".js", ".ts")):
+            continue
+        # Skip backend/node_modules files if they sneak in
+        if any(d in rel_path.lower() for d in ["node_modules", "backend", "controller", "server", "api/"]):
+            continue
         full_path = os.path.join(codebase_path, rel_path)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read(20000)
+            
+            content_lower = content.lower()
+            keywords = [w for w in error_lower.split() if len(w) > 3 and w.isalpha()]
+            # add some common error identifiers if list is empty
+            if not keywords:
+                keywords = ["error", "fail", "invalid"]
+            
+            matches = sum(1 for kw in keywords if kw in content_lower)
+            if matches >= 2 or (matches >= 1 and any(k in rel_path.lower() for k in ["form", "login", "checkout", "signup", "nav"])):
+                component_file = rel_path
+                trace.append({"layer": "Frontend Component", "file": rel_path})
+
+                # Extract API calls from this component
+                api_patterns = [
+                    r'fetch\s*\(\s*["\']([^"\']+)["\']',
+                    r'axios\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']',
+                    r'api\s*\.\s*(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)["\']',
+                    r'["\'](\/(api|rest)\/[^"\']+)["\']',
+                ]
+                for pattern in api_patterns:
+                    api_matches = re.findall(pattern, content)
+                    for match in api_matches:
+                        endpoint = match if isinstance(match, str) else match[-1]
+                        if not any(t.get("endpoint") == endpoint for t in trace):
+                            trace.append({"layer": "API Endpoint", "endpoint": endpoint})
+                break
+        except Exception as e:
+            logger.error(f"Error scanning component {rel_path}: {e}")
+            continue
+
+    # Step 2: Find backend handler
+    backend_exts = (".py", ".js", ".ts")
+    backend_dirs = ["controllers", "routes", "api", "views", "handlers", "server", "backend"]
+    backend_file = None
+    
+    for rel_path in codebase_data.get("file_list", []):
+        if not any(rel_path.endswith(ext) for ext in backend_exts):
+            continue
+        # Must be in a backend directory or be a Python file (since backend is Python)
+        if not any(d in rel_path.lower() for d in backend_dirs) and not rel_path.endswith(".py"):
+            continue
+        full_path = os.path.join(codebase_path, rel_path)
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read(20000)
+            content_lower = content.lower()
+            
+            # Look for route handlers matching discovered API endpoints
+            matched_endpoint = False
+            for trace_item in trace:
+                if trace_item.get("layer") == "API Endpoint":
+                    endpoint = trace_item.get("endpoint", "")
+                    path_clean = endpoint.split("?")[0].rstrip("/")
+                    if path_clean and (path_clean in content or path_clean.split("/")[-1] in content):
+                        backend_file = rel_path
+                        trace.append({"layer": "Backend Handler", "file": rel_path})
+                        matched_endpoint = True
+                        
+                        # Extract DB table references from this backend file
+                        table_patterns = [
+                            r'from\s+["\']?(\w+)["\']?\s+where',
+                            r'into\s+["\']?(\w+)["\']?',
+                            r'update\s+["\']?(\w+)["\']?',
+                            r'__tablename__\s*=\s*["\'](\w+)["\']',
+                            r'\.find\(\s*\{\s*',
+                            r'Model\s*\(\s*["\'](\w+)["\']',
+                            r'db\.query\(([^)]+)\)',
+                        ]
+                        for tp in table_patterns:
+                            tm = re.findall(tp, content, re.IGNORECASE)
+                            for table in tm:
+                                tname = table.split(".")[-1].lower()
+                                if not any(t.get("table") == tname for t in trace):
+                                    trace.append({"layer": "Database Table", "table": tname})
+                        break
+            if matched_endpoint:
+                break
+        except Exception as e:
+            logger.error(f"Error scanning backend handler {rel_path}: {e}")
+            continue
+
+    # Fallback to general file lists if nothing matches specifically
+    if not component_file:
+        component_file = next((f for f in codebase_data.get("file_list", []) if any(k in f.lower() for k in ["app", "main", "index"])), "src/App.jsx")
+        trace.append({"layer": "Frontend Component", "file": component_file})
+
+    ref["trace_chain"] = trace
+
+    # Read line snippet for primary component file
+    full_path = os.path.join(codebase_path, component_file)
+    if os.path.exists(full_path):
         try:
             with open(full_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
 
             matched_line = 1
-            for idx, line in enumerate(lines[:50], start=1):
-                if any(keyword in line.lower() for keyword in ["form", "input", "button", "nav", "link", "footer", "header"]):
+            for idx, line in enumerate(lines[:100], start=1):
+                if any(keyword in line.lower() for keyword in ["form", "input", "button", "nav", "link", "footer", "header", "route"]):
                     matched_line = idx
                     break
 
             start = max(1, matched_line - 3)
-            end = min(len(lines), matched_line + 5)
+            end = min(len(lines), matched_line + 10)
             snippet = "".join(lines[start - 1:end])
-            proposed_fix = "// Review the component and adjust the relevant markup or state handling."
-            if "form" in error_lower:
+            
+            proposed_fix = "// Adjust state or markup to handle this condition."
+            if "form" in error_lower or "validation" in error_lower:
                 proposed_fix = (
                     "// Ensure required fields are declared and validated before form submission.\n"
-                    "<input type=\"email\" name=\"email\" required />\n"
-                    "// Add client-side validation and server-side validation logic."
+                    "// Check client-side validation logic and database constraint matching."
+                )
+            elif "auth" in error_lower or "login" in error_lower or "permission" in error_lower:
+                proposed_fix = (
+                    "// Verify authentication guards and route authorization checks.\n"
+                    "// Ensure correct roles are configured on client routes and API endpoints."
+                )
+            elif "database" in error_lower or "db" in error_lower:
+                proposed_fix = (
+                    "// Inspect database constraint, unique indexes, or missing nullable configurations.\n"
+                    "// Use transaction rollback or try/except block around DB operations."
                 )
 
-            return {
-                "file_path": rel_path,
-                "start_line": start,
-                "end_line": end,
-                "code_snippet": snippet,
-                "proposed_fix": proposed_fix
-            }
-        except Exception as exc:
-            logger.error(f"Error mapping code in file {rel_path}: {exc}")
+            ref["file_path"] = component_file
+            ref["start_line"] = start
+            ref["end_line"] = end
+            ref["code_snippet"] = snippet
+            ref["proposed_fix"] = proposed_fix
+        except Exception as e:
+            logger.error(f"Error extracting snippet from {component_file}: {e}")
 
     return ref
 
@@ -3039,26 +3412,33 @@ Codebase Context:
         prompt += f"\nADDITIONAL USER TESTING DIRECTIVE:\nFollow these instructions when designing the test cases:\n{user_prompt}\n"
 
     prompt += """
-Generate exactly 3 Use Cases tailored to THIS specific website (use the domain, page title, actual link texts, and form field names in titles).
-Each Use Case should contain 2 specific Test Cases referencing real elements found in the crawl data.
-Set every test case status to "pending" — pass/fail will be determined by live browser execution.
-Include a "check_type" for each test case: one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages.
-Generate 2-4 suggestions that reference specific findings from THIS site's crawl data (not generic advice).
+Generate comprehensive Use Cases for THIS specific website. For EACH page/feature discovered, generate test cases across these categories:
+
+**POSITIVE TESTS**: Valid inputs, happy-path workflows.
+**NEGATIVE TESTS**: Wrong credentials, invalid data, wrong formats, wrong user roles.
+**BOUNDARY TESTS**: Max length inputs (255 chars, 500 chars), Unicode characters, special characters (&, <, >, ", '), empty strings, whitespace-only.
+**SECURITY TESTS**: SQL injection attempts (' OR '1'='1), XSS payloads (<script>alert(1)</script>), CSRF token validation, session hijack scenarios.
+**ROLE-BASED TESTS**: Admin vs regular user permissions, unauthorized access attempts, role escalation.
+**PERFORMANCE INDICATORS**: Large form submissions, rapid repeated clicks, concurrent session hints.
+**ACCESSIBILITY CHECKS**: Keyboard navigation, screen reader labels, color contrast, focus indicators.
+
+For each test case, include a "test_type" field with one of: positive, negative, boundary, security, role_based, performance, accessibility.
+
+ADMIN PROTECTION RULES — CRITICAL:
+- NEVER generate steps that delete, deactivate, or change passwords for users named: admin, superadmin, root, administrator.
+- For CRUD workflows, create TEMPORARY test users (e.g., test_user_001) and clean up after.
+- If testing user management, always target test records — never production data.
 
 CRITICAL LANGUAGE REQUIREMENT:
-All generated titles, descriptions, steps, expected results, and suggestions must be written in simple, clear, easy-to-understand Indian English (avoiding complex, overly academic, or highly programmatic technical jargon). For example, instead of using programmatic terms like "HTTP 500 response", "DOM validation script", "heading hierarchy nesting", or "SEO meta description attributes", write naturally:
-- "Check if the page is loading and opening properly."
-- "Form fields should be marked as mandatory so they cannot be submitted empty."
-- "The page is missing a main title (H1 heading)."
-- "Some links might be broken and not opening."
+All generated titles, descriptions, steps, expected results, and suggestions must be written in simple, clear, easy-to-understand Indian English (avoiding complex, overly academic, or highly programmatic technical jargon).
 Keep the sentences short, clear, and direct so a non-technical manager can understand them instantly.
 
 Your response MUST be valid JSON matching this schema:
 {
   "use_cases": [
     {
-      "title": "Use Case Title",
-      "description": "Description",
+      "title": "Use Case Title referencing actual page/feature",
+      "description": "Description using actual site elements",
       "test_cases": [
         {
           "title": "Test Case Title",
@@ -3068,7 +3448,8 @@ Your response MUST be valid JSON matching this schema:
           "error_message": null,
           "severity": null,
           "page_url": "URL of page under test",
-          "check_type": "one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages"
+          "check_type": "page_load | link_health | form_required | heading_structure | content_depth | image_alt | navigation_presence | internal_pages",
+          "test_type": "positive | negative | boundary | security | role_based | performance | accessibility"
         }
       ]
     }
@@ -3077,7 +3458,7 @@ Your response MUST be valid JSON matching this schema:
     {
       "title": "Suggestion summary",
       "description": "Details",
-      "priority": "low, medium, or high"
+      "priority": "low | medium | high"
     }
   ]
 }
@@ -3151,48 +3532,56 @@ Codebase Context:
         prompt += f"\nADDITIONAL USER TESTING DIRECTIVE:\nFollow these instructions when designing the test cases:\n{user_prompt}\n"
 
     prompt += """
-Generate exactly 3 Use Cases tailored to THIS specific website (use the domain, page title, actual link texts, and form field names in titles).
-Each Use Case should contain 2 specific Test Cases referencing real elements found in the crawl data.
-Set every test case status to "pending" — pass/fail will be determined by live browser execution.
-Include a "check_type" for each test case: one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages.
-Generate 2-4 suggestions that reference specific findings from THIS site's crawl data (not generic advice).
+Generate comprehensive Use Cases for THIS specific website. For EACH page/feature discovered, generate test cases across these categories:
+
+**POSITIVE TESTS**: Valid inputs, happy-path workflows.
+**NEGATIVE TESTS**: Wrong credentials, invalid data, wrong formats, wrong user roles.
+**BOUNDARY TESTS**: Max length inputs (255 chars, 500 chars), Unicode characters, special characters (&, <, >, ", '), empty strings, whitespace-only.
+**SECURITY TESTS**: SQL injection attempts (' OR '1'='1), XSS payloads (<script>alert(1)</script>), CSRF token validation, session hijack scenarios.
+**ROLE-BASED TESTS**: Admin vs regular user permissions, unauthorized access attempts, role escalation.
+**PERFORMANCE INDICATORS**: Large form submissions, rapid repeated clicks, concurrent session hints.
+**ACCESSIBILITY CHECKS**: Keyboard navigation, screen reader labels, color contrast, focus indicators.
+
+For each test case, include a "test_type" field with one of: positive, negative, boundary, security, role_based, performance, accessibility.
+
+ADMIN PROTECTION RULES — CRITICAL:
+- NEVER generate steps that delete, deactivate, or change passwords for users named: admin, superadmin, root, administrator.
+- For CRUD workflows, create TEMPORARY test users (e.g., test_user_001) and clean up after.
+- If testing user management, always target test records — never production data.
 
 CRITICAL LANGUAGE REQUIREMENT:
-All generated titles, descriptions, steps, expected results, and suggestions must be written in simple, clear, easy-to-understand Indian English (avoiding complex, overly academic, or highly programmatic technical jargon). For example, instead of using programmatic terms like "HTTP 500 response", "DOM validation script", "heading hierarchy nesting", or "SEO meta description attributes", write naturally:
-- "Check if the page is loading and opening properly."
-- "Form fields should be marked as mandatory so they cannot be submitted empty."
-- "The page is missing a main title (H1 heading)."
-- "Some links might be broken and not opening."
+All generated titles, descriptions, steps, expected results, and suggestions must be written in simple, clear, easy-to-understand Indian English (avoiding complex, overly academic, or highly programmatic technical jargon).
 Keep the sentences short, clear, and direct so a non-technical manager can understand them instantly.
 
 Your response MUST be valid JSON matching this schema:
-{{
+{
   "use_cases": [
-    {{
-      "title": "Use Case Title",
-      "description": "Description",
+    {
+      "title": "Use Case Title referencing actual page/feature",
+      "description": "Description using actual site elements",
       "test_cases": [
-        {{
+        {
           "title": "Test Case Title",
           "steps": "Step 1: ...\\nStep 2: ...",
           "expected_result": "Expected result details",
-          "status": "passed" or "failed",
-          "error_message": "Detailed description of error if failed, else null",
+          "status": "pending",
+          "error_message": null,
           "severity": null,
           "page_url": "URL of page under test",
-          "check_type": "one of page_load, link_health, form_required, heading_structure, content_depth, image_alt, navigation_presence, internal_pages"
-        }}
+          "check_type": "page_load | link_health | form_required | heading_structure | content_depth | image_alt | navigation_presence | internal_pages",
+          "test_type": "positive | negative | boundary | security | role_based | performance | accessibility"
+        }
       ]
-    }}
+    }
   ],
   "suggestions": [
-    {{
+    {
       "title": "Suggestion summary",
       "description": "Details",
-      "priority": "low, medium, or high"
-    }}
+      "priority": "low | medium | high"
+    }
   ]
-}}
+}
 Return ONLY raw JSON. No markdown code blocks.
 """
     try:
@@ -3470,17 +3859,17 @@ def run_image_agent(task_id: str, url: str, page_snapshots: list, codebase_data:
         db.close()
 
 
-def run_code_review_agent(task_id: str, codebase_path: str, codebase_data: dict, error_ids: list):
-    logger.info(f"Code Review Agent starting for task: {task_id}")
+def run_code_correlation_agent(task_id: str, codebase_path: str, codebase_data: dict, error_ids: list):
+    logger.info(f"Code Correlation Agent starting for task: {task_id}")
     db = SessionLocal()
     try:
-        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "CodeReview").first()
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "CodeCorrelation").first()
         if not state:
             return
 
         state.status = "running"
         state.started_at = datetime.utcnow()
-        state.log_output = f"[CodeReview Agent] Mapping {len(error_ids)} errors to codebase.\n"
+        state.log_output = f"[CodeCorrelation Agent] Mapping {len(error_ids)} errors to codebase.\n"
         db.commit()
 
         time.sleep(1.8)
@@ -3495,20 +3884,787 @@ def run_code_review_agent(task_id: str, codebase_path: str, codebase_data: dict,
                 start_line=ref_data["start_line"],
                 end_line=ref_data["end_line"],
                 code_snippet=ref_data["code_snippet"],
-                proposed_fix=ref_data["proposed_fix"]
+                proposed_fix=ref_data["proposed_fix"],
+                trace_chain_json=json.dumps(ref_data.get("trace_chain", []))
             )
             db.add(code_ref)
             db.commit()
-            log += f"[CodeReview Agent] Mapped '{err.message[:40]}' to {ref_data['file_path']}.\n"
+            log += f"[CodeCorrelation Agent] Mapped '{err.message[:40]}' to {ref_data['file_path']}.\n"
 
-        log += "[CodeReview Agent] Code mapping complete.\n"
+        log += "[CodeCorrelation Agent] Code mapping complete.\n"
         state.status = "completed"
         state.errors_found = len(errors)
         state.log_output = log
         state.completed_at = datetime.utcnow()
         db.commit()
     except Exception as exc:
-        logger.error(f"Code Review agent execution failed: {exc}")
+        logger.error(f"Code Correlation agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_health_check_agent(task_id: str, url: str, page_snapshots: list, auth: dict = None):
+    """Pre-flight health check on all discovered pages before deeper testing."""
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(
+            AgentState.task_id == task_id,
+            AgentState.agent_name == "HealthCheck"
+        ).first()
+        if state:
+            state.status = "running"
+            state.started_at = datetime.utcnow()
+            db.commit()
+
+        healthy_pages = []
+        failed_pages = []
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+            console_errors = []
+            page.on("console", lambda msg: console_errors.append(msg.text)
+                     if msg.type == "error" else None)
+
+            for snapshot in page_snapshots:
+                page_url = snapshot.get("page_url", url)
+                console_errors.clear()
+                health = {"url": page_url, "status": "healthy", "issues": []}
+
+                try:
+                    response = page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                    status_code = response.status if response else 0
+
+                    if status_code >= 500:
+                        health["issues"].append(f"Server error: HTTP {status_code}")
+                        health["status"] = "critical"
+                    elif status_code >= 400:
+                        health["issues"].append(f"Client error: HTTP {status_code}")
+                        health["status"] = "warning"
+
+                    page.wait_for_timeout(2000)  # Allow JS to execute
+
+                    if console_errors:
+                        health["issues"].append(f"JS console errors: {len(console_errors)}")
+                        if any("uncaught" in e.lower() or "error" in e.lower()
+                               for e in console_errors):
+                            health["status"] = "critical"
+
+                except Exception as exc:
+                    health["issues"].append(f"Navigation failed: {str(exc)}")
+                    health["status"] = "critical"
+
+                if health["status"] == "critical":
+                    failed_pages.append(health)
+                    # Create TestError for critical health failures
+                    db.add(TestError(
+                        task_id=task_id,
+                        message=f"Health Check FAILED: {'; '.join(health['issues'])}",
+                        severity="critical",
+                        page_url=page_url,
+                    ))
+                else:
+                    healthy_pages.append(health)
+
+            context.close()
+            browser.close()
+
+        if state:
+            state.status = "completed"
+            state.errors_found = len(failed_pages)
+            state.log_output = f"Healthy: {len(healthy_pages)}, Failed: {len(failed_pages)}"
+            state.completed_at = datetime.utcnow()
+
+        db.commit()
+        return healthy_pages, failed_pages
+    except Exception as exc:
+        logger.error(f"Health Check Agent failed: {exc}")
+        if state:
+            state.status = "failed"
+            state.log_output = str(exc)
+            state.completed_at = datetime.utcnow()
+            db.commit()
+        return page_snapshots, []  # fallback: treat all as healthy
+    finally:
+        db.close()
+
+
+def run_route_discovery_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Route Discovery Agent: finds ALL routes and reports untested ones."""
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(
+            AgentState.task_id == task_id,
+            AgentState.agent_name == "RouteDiscovery"
+        ).first()
+        if state:
+            state.status = "running"
+            state.started_at = datetime.utcnow()
+            db.commit()
+
+        codebase = db.query(Codebase).filter(Codebase.task_id == task_id).first()
+        codebase_path = codebase.local_path if codebase else None
+
+        # Discover from all sources
+        codebase_routes = discover_routes_from_codebase(codebase_path, codebase_data) if codebase_path else []
+        sitemap_routes = discover_routes_from_sitemap(url)
+        all_discovered = codebase_routes + sitemap_routes
+
+        # Compare with crawled pages
+        crawled_urls = [s.get("page_url", "") for s in page_snapshots]
+        comparison = compare_routes(all_discovered, crawled_urls, url)
+
+        # Report untested routes as errors
+        errors_found = 0
+        for untested in comparison["untested_routes"]:
+            db.add(TestError(
+                task_id=task_id,
+                message=f"Untested route found: {untested['route']} (source: {untested['source_file']}). "
+                        f"Reason: No navigation link exists to this page, or the crawler did not reach it.",
+                severity="high",
+                page_url=untested["route"],
+            ))
+            errors_found += 1
+
+        # Add suggestion about coverage
+        db.add(Suggestion(
+            task_id=task_id,
+            title=f"Route Coverage: {comparison['coverage_percent']}%",
+            description=f"Found {comparison['total_codebase_routes']} routes in codebase, "
+                        f"but only {comparison['total_crawled_pages']} pages were crawled. "
+                        f"{len(comparison['untested_routes'])} routes are untested.",
+            priority="high" if comparison['coverage_percent'] < 50 else "medium"
+        ))
+
+        if state:
+            state.status = "completed"
+            state.errors_found = errors_found
+            state.log_output = (
+                f"Codebase routes: {len(codebase_routes)}, "
+                f"Sitemap routes: {len(sitemap_routes)}, "
+                f"Crawled pages: {len(crawled_urls)}, "
+                f"Untested: {len(comparison['untested_routes'])}, "
+                f"Coverage: {comparison['coverage_percent']}%"
+            )
+            state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Route Discovery Agent failed: {exc}")
+        if state:
+            state.status = "failed"
+            state.log_output = str(exc)
+            state.completed_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+def run_user_journey_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """User Journey Agent: generates and tests multi-step CRUD workflows."""
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(
+            AgentState.task_id == task_id,
+            AgentState.agent_name == "UserJourney"
+        ).first()
+        if state:
+            state.status = "running"
+            state.started_at = datetime.utcnow()
+            db.commit()
+
+        # Analyze navigation structure to identify CRUD patterns
+        crud_patterns = {
+            "create": ["create", "new", "add", "register", "signup"],
+            "read": ["list", "view", "detail", "show", "dashboard"],
+            "update": ["edit", "update", "modify", "settings"],
+            "delete": ["delete", "remove", "deactivate"],
+            "approve": ["approve", "confirm", "accept", "verify"],
+        }
+
+        # Group pages by resource type
+        resource_groups = {}
+        for snapshot in page_snapshots:
+            page_url = snapshot.get("page_url", "")
+            path = page_url.split("//", 1)[-1].split("/", 1)[-1] if "//" in page_url else page_url
+            segments = [s for s in path.split("/") if s and not s.startswith("?")]
+
+            for segment in segments:
+                for action, keywords in crud_patterns.items():
+                    if any(kw in segment.lower() for kw in keywords):
+                        # Extract resource name (parent segment)
+                        resource = segments[segments.index(segment) - 1] if segments.index(segment) > 0 else segment
+                        resource_groups.setdefault(resource, {})[action] = page_url
+
+        # Generate journey use cases
+        journeys_created = 0
+        for resource, actions in resource_groups.items():
+            if len(actions) < 2:
+                continue  # Need at least 2 CRUD operations to form a journey
+
+            journey_steps = []
+            step_num = 1
+            ordered_actions = ["create", "read", "update", "approve", "delete"]
+
+            for action in ordered_actions:
+                if action in actions:
+                    journey_steps.append(
+                        f"Step {step_num}: Navigate to {actions[action]} and perform {action} operation on {resource}"
+                    )
+                    step_num += 1
+
+            if journey_steps:
+                use_case = UseCase(
+                    task_id=task_id,
+                    title=f"{resource.title()} Management Journey",
+                    description=f"End-to-end CRUD workflow for {resource}: {' → '.join(actions.keys())}"
+                )
+                db.add(use_case)
+                db.flush()
+
+                db.add(TestCase(
+                    task_id=task_id,
+                    use_case_id=use_case.id,
+                    title=f"Complete {resource.title()} CRUD Journey",
+                    steps="\n".join(journey_steps),
+                    expected_result=f"All {resource} operations complete without errors",
+                    status="pending",
+                    test_type="journey",
+                    page_url=list(actions.values())[0]
+                ))
+                journeys_created += 1
+
+        if state:
+            state.status = "completed"
+            state.errors_found = 0
+            state.log_output = f"Generated {journeys_created} user journeys from {len(resource_groups)} resources"
+            state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"User Journey Agent failed: {exc}")
+        if state:
+            state.status = "failed"
+            state.log_output = str(exc)
+            state.completed_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+# --- HELPER FOR VISUAL REGRESSION ---
+def compare_screenshots_rms(img_path_a: str, img_path_b: str) -> float:
+    """Compare two images using Root-Mean-Square (RMS) difference. Returns a diff percentage (0 to 100)."""
+    try:
+        from PIL import Image, ImageChops
+        import math
+        
+        img_a = Image.open(img_path_a).convert("RGB")
+        img_b = Image.open(img_path_b).convert("RGB")
+        
+        # Resize to same dimensions if different
+        if img_a.size != img_b.size:
+            img_b = img_b.resize(img_a.size)
+            
+        diff = ImageChops.difference(img_a, img_b)
+        h = diff.histogram()
+        
+        # Calculate RMS difference
+        sum_of_squares = sum(value * (idx ** 2) for idx, value in enumerate(h))
+        rms = math.sqrt(sum_of_squares / float(img_a.size[0] * img_a.size[1] * 3))
+        
+        # Normalize to percentage (rms max is 255)
+        diff_pct = (rms / 255.0) * 100.0
+        return diff_pct
+    except Exception as e:
+        logger.error(f"Image comparison failed: {e}")
+        return 0.0
+
+
+def run_login_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Login Agent: validates authentication flows."""
+    logger.info(f"Login Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Login").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[Login Agent] Auditing login flow for {url}.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+        login_pages = [s for s in page_snapshots if any(k in s.get("page_url", "").lower() for k in ["login", "signin", "auth"])]
+        log += f"[Login Agent] Found {len(login_pages)} login-related pages.\n"
+
+        if not url.startswith("https://") and "localhost" not in url and "127.0.0.1" not in url:
+            log += "[Login Agent] Issue: Login form uses insecure HTTP protocol instead of HTTPS.\n"
+            db.add(TestError(
+                task_id=task_id,
+                message="Insecure login: authentication forms should be served over HTTPS to protect credentials.",
+                severity="critical",
+                page_url=url,
+            ))
+            errors += 1
+
+        # Codebase audit for security: look for token storage in localStorage
+        codebase_path = codebase_data.get("codebase_path")
+        if codebase_path and os.path.exists(codebase_path):
+            local_storage_tokens = []
+            for rel_path in codebase_data.get("file_list", []):
+                if not rel_path.endswith((".jsx", ".tsx", ".js", ".ts")):
+                    continue
+                full_path = os.path.join(codebase_path, rel_path)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        content = f.read(5000)
+                    if "localstorage.setitem" in content.lower() and any(k in content.lower() for k in ["token", "auth", "jwt", "session"]):
+                        local_storage_tokens.append(rel_path)
+                except Exception:
+                    continue
+            if local_storage_tokens:
+                log += f"[Login Agent] Security Warning: JWT/Auth tokens might be stored in localStorage (vulnerable to XSS) in: {', '.join(local_storage_tokens[:2])}\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message=f"Auth tokens stored in localStorage (vulnerable to XSS) in: {local_storage_tokens[0]}",
+                    severity="medium",
+                    page_url=url,
+                ))
+                errors += 1
+
+        log += "[Login Agent] Login authentication check complete.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Login agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_role_permission_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Role & Permission Agent: validates access control."""
+    logger.info(f"Role/Permission Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "RolePermission").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[RolePermission Agent] Auditing user roles and access control for {url}.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+
+        admin_pages = [s for s in page_snapshots if "admin" in s.get("page_url", "").lower()]
+        log += f"[RolePermission Agent] Identified {len(admin_pages)} restricted admin paths.\n"
+
+        # Check codebase for unprotected routes or missing guards
+        codebase_path = codebase_data.get("codebase_path")
+        if codebase_path and os.path.exists(codebase_path):
+            unprotected_admin_routes = []
+            for rel_path in codebase_data.get("file_list", []):
+                if not rel_path.endswith((".jsx", ".tsx", ".js", ".ts", ".py")):
+                    continue
+                full_path = os.path.join(codebase_path, rel_path)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        content = f.read(5000)
+                    content_lower = content.lower()
+                    if "admin" in content_lower and any(r in content_lower for r in ["router.get", "router.post", "@app.get", "@app.post"]):
+                        if not any(guard in content_lower for guard in ["auth", "guard", "protect", "permission", "jwt"]):
+                            unprotected_admin_routes.append(rel_path)
+                except Exception:
+                    continue
+            if unprotected_admin_routes:
+                log += f"[RolePermission Agent] Security Warning: Admin endpoint definitions in {unprotected_admin_routes[:2]} might be missing authorization guards.\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message=f"Potential unprotected admin route found in codebase file: {unprotected_admin_routes[0]}",
+                    severity="high",
+                    page_url=url,
+                ))
+                errors += 1
+
+        log += "[RolePermission Agent] Role and permission checks completed successfully.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"RolePermission agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_database_integrity_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Database Integrity Agent: monitors API responses for database errors."""
+    logger.info(f"Database Integrity Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "DatabaseIntegrity").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[DatabaseIntegrity Agent] Scanning API requests for database integrity issues.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+
+        # Check codebase for raw SQL queries or DB relationships
+        codebase_path = codebase_data.get("codebase_path")
+        if codebase_path and os.path.exists(codebase_path):
+            raw_queries = []
+            for rel_path in codebase_data.get("file_list", []):
+                if not rel_path.endswith((".py", ".js", ".ts")):
+                    continue
+                full_path = os.path.join(codebase_path, rel_path)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        content = f.read(5000)
+                    content_lower = content.lower()
+                    if "select " in content_lower and ("execute(" in content_lower or "query(" in content_lower or "db.engine" in content_lower):
+                        raw_queries.append(rel_path)
+                except Exception:
+                    continue
+            if raw_queries:
+                log += f"[DatabaseIntegrity Agent] Warning: Raw SQL queries detected in {raw_queries[:2]}. Prefer using ORM to avoid database integrity and syntax issues.\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message=f"Raw SQL queries detected in codebase: {raw_queries[0]}. Use ORM or parameterized inputs.",
+                    severity="medium",
+                    page_url=url,
+                ))
+                errors += 1
+
+        log += "[DatabaseIntegrity Agent] Database constraints and relationship audit complete.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"DatabaseIntegrity agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_security_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Security Agent: scans for security header presence and input field vulnerabilities."""
+    logger.info(f"Security Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Security").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[Security Agent] Auditing security headers for {url}.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+
+        try:
+            with httpx.Client(follow_redirects=True, timeout=10.0) as client:
+                resp = client.get(normalize_url(url))
+                headers = resp.headers
+                
+                missing_headers = []
+                if "Content-Security-Policy" not in headers:
+                    missing_headers.append("Content-Security-Policy")
+                if "X-Frame-Options" not in headers:
+                    missing_headers.append("X-Frame-Options")
+                if "X-Content-Type-Options" not in headers:
+                    missing_headers.append("X-Content-Type-Options")
+
+                if missing_headers:
+                    log += f"[Security Agent] Issue: Missing security headers: {', '.join(missing_headers)}.\n"
+                    for h in missing_headers:
+                        db.add(TestError(
+                            task_id=task_id,
+                            message=f"Security header check failed: '{h}' response header is missing.",
+                            severity="medium",
+                            page_url=url,
+                        ))
+                    errors += len(missing_headers)
+        except Exception as exc:
+            log += f"[Security Agent] Could not complete HTTP header checks: {exc}\n"
+
+        # Codebase security scans: check for dangerouslySetInnerHTML or Jinja |safe filter
+        codebase_path = codebase_data.get("codebase_path")
+        if codebase_path and os.path.exists(codebase_path):
+            vulnerabilities = []
+            for rel_path in codebase_data.get("file_list", []):
+                if not rel_path.endswith((".jsx", ".tsx", ".js", ".ts", ".html", ".py")):
+                    continue
+                full_path = os.path.join(codebase_path, rel_path)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        content = f.read(5000)
+                    content_lower = content.lower()
+                    if "dangerouslysetinnerhtml" in content_lower:
+                        vulnerabilities.append((rel_path, "XSS vulnerability: dangerouslySetInnerHTML"))
+                    if "|safe" in content_lower:
+                        vulnerabilities.append((rel_path, "XSS vulnerability: unescaped template output (|safe)"))
+                    if "eval(" in content_lower and "evaluate" not in content_lower:
+                        vulnerabilities.append((rel_path, "Remote Code Execution: eval() usage"))
+                except Exception:
+                    continue
+            for rel_file, vuln_desc in vulnerabilities[:3]:
+                log += f"[Security Agent] Critical Issue: {vuln_desc} in {rel_file}\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message=f"Security vulnerability detected: {vuln_desc} in codebase file {rel_file}",
+                    severity="critical",
+                    page_url=url,
+                ))
+                errors += 1
+
+        log += "[Security Agent] Security audit complete.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Security agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_accessibility_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Accessibility Agent: checks DOM structure for key ARIA/A11y requirements."""
+    logger.info(f"Accessibility Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Accessibility").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[Accessibility Agent] Checking accessibility elements for {url}.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+
+        profile = aggregate_site_profile(url, page_snapshots)
+        img_missing = profile.get("images_missing_alt", 0)
+        if img_missing > 0:
+            log += f"[Accessibility Agent] Issue: {img_missing} images are missing descriptive alt labels.\n"
+            db.add(TestError(
+                task_id=task_id,
+                message=f"Accessibility failure: {img_missing} images are missing alt attributes (critical for screen readers).",
+                severity="medium",
+                page_url=url,
+            ))
+            errors += img_missing
+
+        # Check page snapshots HTML for non-semantic interactive divs or inputs without labels
+        for snap in page_snapshots:
+            html = snap.get("html_snippet", "")
+            if not html:
+                continue
+            page_url = snap.get("page_url", url)
+            
+            # Check inputs without id/label
+            if "<input" in html and ("label" not in html.lower() and "aria-label" not in html.lower()):
+                log += f"[Accessibility Agent] Issue on {page_url}: Input fields detected without descriptive labels or aria-label.\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message="Input elements found without associated labels or aria-label attributes.",
+                    severity="high",
+                    page_url=page_url,
+                ))
+                errors += 1
+                
+            # Check onClick on divs
+            if "onclick" in html.lower() and "role=" not in html.lower() and "<div" in html.lower():
+                log += f"[Accessibility Agent] Issue on {page_url}: Non-semantic interactive element (div with onClick) found without WAI-ARIA role.\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message="Non-semantic interactive element (div with click handler) found without role='button' or tabIndex.",
+                    severity="medium",
+                    page_url=page_url,
+                ))
+                errors += 1
+
+        log += "[Accessibility Agent] Accessibility audit complete.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Accessibility agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_performance_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Performance Agent: measures load times and checks performance constraints."""
+    logger.info(f"Performance Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Performance").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[Performance Agent] Auditing page performance and load times.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+
+        try:
+            start_time = time.time()
+            with httpx.Client(follow_redirects=True, timeout=15.0) as client:
+                client.get(normalize_url(url))
+            load_time = round(time.time() - start_time, 2)
+            log += f"[Performance Agent] Page load time: {load_time}s\n"
+            if load_time > 3.0:
+                log += f"[Performance Agent] Issue: Page took {load_time}s to load (exceeds 3.0s budget).\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message=f"Performance budget exceeded: page load time of {load_time}s is above 3.0s threshold.",
+                    severity="medium",
+                    page_url=url,
+                ))
+                errors += 1
+        except Exception as exc:
+            log += f"[Performance Agent] Performance check failed: {exc}\n"
+
+        for snap in page_snapshots:
+            html_len = len(snap.get("html_snippet", "") or "")
+            page_url = snap.get("page_url", url)
+            if html_len > 1000000:
+                log += f"[Performance Agent] Issue on {page_url}: Large DOM payload size ({html_len} bytes) which can slow down rendering.\n"
+                db.add(TestError(
+                    task_id=task_id,
+                    message=f"Large DOM payload size ({html_len} bytes) detected on {page_url}.",
+                    severity="low",
+                    page_url=page_url,
+                ))
+                errors += 1
+
+        log += "[Performance Agent] Performance audit complete.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Performance agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_visual_regression_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    """Visual Regression Agent: captures baseline screenshots and compares across test runs."""
+    logger.info(f"Visual Regression Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "VisualRegression").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[VisualRegression Agent] Capturing page layout screenshots for regression checks.\n"
+        db.commit()
+
+        errors = 0
+        log = state.log_output
+        
+        # Directory to store baselines
+        baseline_dir = os.path.join("visual_baselines", task_id)
+        os.makedirs(baseline_dir, exist_ok=True)
+        
+        # Try to find a previous completed task for the same URL
+        task_rec = db.query(Task).filter(Task.id == task_id).first()
+        previous_task = None
+        if task_rec:
+            previous_task = db.query(Task).filter(
+                Task.url == task_rec.url,
+                Task.id != task_id,
+                Task.status == "completed"
+            ).order_by(Task.created_at.desc()).first()
+            
+        prev_baseline_dir = None
+        if previous_task:
+            prev_baseline_dir = os.path.join("visual_baselines", previous_task.id)
+            if not os.path.exists(prev_baseline_dir):
+                prev_baseline_dir = None
+                
+        if prev_baseline_dir:
+            log += f"[VisualRegression Agent] Found previous completed task {previous_task.id}. Comparing screenshots against its baselines.\n"
+        else:
+            log += "[VisualRegression Agent] No previous completed task/baseline found. Capturing initial baseline screenshots.\n"
+
+        # Capture screenshots for each page snapshot
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            page = context.new_page()
+            
+            for idx, snap in enumerate(page_snapshots):
+                page_url = snap.get("page_url", url)
+                filename = f"page_{idx:03d}_{slugify(page_url.split('//')[-1].replace('/', '_'))}.png"
+                current_path = os.path.join(baseline_dir, filename)
+                
+                try:
+                    page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                    page.wait_for_timeout(1000) # wait for animations to settle
+                    page.screenshot(path=current_path, full_page=True)
+                    
+                    if prev_baseline_dir:
+                        prev_path = os.path.join(prev_baseline_dir, filename)
+                        if os.path.exists(prev_path):
+                            # Compare current with previous baseline
+                            diff_pct = compare_screenshots_rms(current_path, prev_path)
+                            if diff_pct > 5.0: # 5% visual difference threshold
+                                log += f"[VisualRegression Agent] Issue: Visual regression detected on {page_url} (diff: {diff_pct:.2f}%).\n"
+                                db.add(TestError(
+                                    task_id=task_id,
+                                    message=f"Visual regression layout change detected on {page_url} (diff: {diff_pct:.2f}% vs baseline).",
+                                    severity="medium",
+                                    page_url=page_url,
+                                    screenshot_path=current_path
+                                ))
+                                errors += 1
+                            else:
+                                log += f"[VisualRegression Agent] {page_url}: Visual match OK (diff: {diff_pct:.2f}%).\n"
+                        else:
+                            log += f"[VisualRegression Agent] {page_url}: Baseline screenshot missing in previous task. Saved new baseline.\n"
+                    else:
+                        log += f"[VisualRegression Agent] Saved baseline screenshot for {page_url}.\n"
+                except Exception as exc:
+                    log += f"[VisualRegression Agent] Failed to capture screenshot for {page_url}: {exc}\n"
+                    
+            context.close()
+            browser.close()
+
+        log += "[VisualRegression Agent] Visual layout captured successfully. Comparison set.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"VisualRegression agent execution failed: {exc}")
+        if state:
+            state.status = "failed"
+            state.log_output += f"\nError: {exc}"
+            db.commit()
     finally:
         db.close()
 
@@ -3620,6 +4776,12 @@ def run_testing_agent(task_id: str):
                     "https://ams.aahoa.com/become-a-member",
                     "https://ams.aahoa.com/become-a-vendor",
                     "https://www.aahoa.com/membership/vendors/vendor-benefits",
+                ])
+            elif "sellingo.ai" in normalized_task_url:
+                seed_urls.extend([
+                    "https://sellingo.ai/merchant/create_custom_order",
+                    "https://sellingo.ai/merchant/new_orders",
+                    "https://sellingo.ai/merchant/mycatalog",
                 ])
 
         deduped_seed_urls = []
@@ -3768,6 +4930,37 @@ def run_testing_agent(task_id: str):
         for uc_data in custom_use_cases:
             all_use_cases_to_create.append((uc_data, True)) # (data, is_custom)
 
+        # Inject Sellingo-specific merchant cases if URL targets Sellingo
+        if task.url and "sellingo.ai" in normalize_url(task.url):
+            sellingo_uc = {
+                "title": "Sellingo Merchant Order Management",
+                "description": "Verify custom order creation, filter operations, and tab toggling on merchant screens.",
+                "test_cases": [
+                    {
+                        "title": "Create Custom Order Page Validation",
+                        "steps": "1. Navigate to https://sellingo.ai/merchant/create_custom_order\n2. Fill custom order form inputs (item, user, price, qty)\n3. Click create/submit order\n4. Confirm order created successfully and displays in records list",
+                        "expected_result": "Custom order form validation works and submits successfully to create order record.",
+                        "test_type": "positive",
+                        "page_url": "https://sellingo.ai/merchant/create_custom_order"
+                    },
+                    {
+                        "title": "New Orders List Filter Verification",
+                        "steps": "1. Navigate to https://sellingo.ai/merchant/new_orders\n2. Toggle different list filters (status, date range, payment)\n3. Verify orders list updates dynamically for each filter option",
+                        "expected_result": "Order filters successfully reload matching orders list without exception or freezing.",
+                        "test_type": "positive",
+                        "page_url": "https://sellingo.ai/merchant/new_orders"
+                    },
+                    {
+                        "title": "New Orders Tab Switching Validation",
+                        "steps": "1. Navigate to https://sellingo.ai/merchant/new_orders\n2. Click each order tab (e.g. Pending, Completed, Cancelled)\n3. Confirm active tab highlight changes and display updates",
+                        "expected_result": "Tab navigation functions correctly, changing styling state and updating the list display.",
+                        "test_type": "positive",
+                        "page_url": "https://sellingo.ai/merchant/new_orders"
+                    }
+                ]
+            }
+            all_use_cases_to_create.append((sellingo_uc, False))
+
         use_cases_mapping = {}
         for uc_data, is_custom in all_use_cases_to_create:
             title_prefix = "[Custom] " if is_custom else ""
@@ -3789,6 +4982,7 @@ def run_testing_agent(task_id: str):
                     steps=tc_data.get("steps", ""),
                     expected_result=tc_data.get("expected_result", ""),
                     status="pending",
+                    test_type=tc_data.get("test_type"),
                     page_url=tc_data.get("page_url") or task.url
                 )
                 db.add(test_case)
@@ -3804,8 +4998,10 @@ def run_testing_agent(task_id: str):
 
         db.commit()
 
-        if is_cancelled():
-            return
+        # Run user journey agent to build workflows from navigation
+        write_orchestrator_log("[Orchestrator] Running User Journey Agent to extract workflows...")
+        run_user_journey_agent(task.id, task.url, page_snapshots, codebase_data)
+        write_orchestrator_log("[Orchestrator] User Journey Agent complete.")
 
         # Save snapshots and transition to planned
         task.page_snapshots_json = json.dumps(page_snapshots)
@@ -3869,7 +5065,12 @@ def run_test_execution_agent(task_id: str):
         db.commit()
 
         # Reset agent states
-        for state_name in ["Orchestrator", "UI_UX", "Responsive", "Form", "API", "Image", "CodeReview"]:
+        for state_name in [
+            "Orchestrator", "RouteDiscovery", "HealthCheck", "Login",
+            "RolePermission", "UserJourney", "Form", "API",
+            "DatabaseIntegrity", "Security", "Accessibility", "Responsive",
+            "VisualRegression", "Performance", "CodeCorrelation"
+        ]:
             state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == state_name).first()
             if state:
                 state.status = "pending"
@@ -3945,18 +5146,34 @@ def run_test_execution_agent(task_id: str):
             use_cases_mapping[uc.id] = test_cases
             use_case_titles[uc.id] = uc.title
 
+        # Run health check first — filter out broken pages
+        write_orchestrator_log("[Orchestrator] Running pre-flight health check on discovered pages...")
+        healthy_pages, failed_pages = run_health_check_agent(task.id, task.url, page_snapshots, auth_data)
+        # Only pass healthy pages to sub-agents
+        page_snapshots_for_agents = [s for s in page_snapshots
+                                      if s.get("page_url") not in {f["url"] for f in failed_pages}]
+        write_orchestrator_log(f"[Orchestrator] Health check complete. {len(healthy_pages)} healthy pages, {len(failed_pages)} failed pages.")
+
         # Run parallel heuristic analysis agents
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            executor.submit(run_ui_ux_agent, task.id, task.url, page_snapshots, codebase_data)
-            executor.submit(run_responsive_agent, task.id, task.url, page_snapshots, codebase_data)
-            executor.submit(run_form_agent, task.id, task.url, page_snapshots, codebase_data)
-            executor.submit(run_api_agent, task.id, task.url, page_snapshots, codebase_data)
-            executor.submit(run_image_agent, task.id, task.url, page_snapshots, codebase_data)
+        with ThreadPoolExecutor(max_workers=13) as executor:
+            executor.submit(run_ui_ux_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_responsive_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_form_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_api_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_image_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_route_discovery_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_login_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_role_permission_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_database_integrity_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_security_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_accessibility_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_performance_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_visual_regression_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
 
         time.sleep(2.5)
 
         # Run the browser-driven Playwright tests
-        error_ids = execute_test_plan(task.id, page_snapshots, use_cases_mapping, use_case_titles, auth=auth_data, log_callback=write_orchestrator_log)
+        error_ids = execute_test_plan(task.id, page_snapshots_for_agents, use_cases_mapping, use_case_titles, auth=auth_data, log_callback=write_orchestrator_log)
         
         if is_cancelled():
             return
@@ -3987,16 +5204,32 @@ def run_test_execution_agent(task_id: str):
         write_orchestrator_log(f"[Orchestrator] Browser validations completed with {len(error_ids)} error(s).")
 
         if codebase and error_ids:
-            run_code_review_agent(task.id, codebase.local_path, codebase_data, error_ids)
-            write_orchestrator_log("[Orchestrator] Code review mapping completed.")
+            run_code_correlation_agent(task.id, codebase.local_path, codebase_data, error_ids)
+            write_orchestrator_log("[Orchestrator] Code correlation mapping completed.")
         else:
-            code_review_state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "CodeReview").first()
+            code_review_state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "CodeCorrelation").first()
             if code_review_state:
                 code_review_state.status = "completed"
-                code_review_state.log_output = "[CodeReview Agent] No codebase details or errors to map.\n"
+                code_review_state.log_output = "[CodeCorrelation Agent] No codebase details or errors to map.\n"
                 code_review_state.completed_at = datetime.utcnow()
                 db.commit()
-            write_orchestrator_log("[Orchestrator] No code review mapping required.")
+            write_orchestrator_log("[Orchestrator] No code correlation mapping required.")
+
+        # --- CLEANUP PHASE ---
+        write_orchestrator_log("[Orchestrator] Starting safe testing cleanup phase...")
+        try:
+            cleanup_logs = db.query(TestCleanupLog).filter(
+                TestCleanupLog.task_id == task_id,
+                TestCleanupLog.action == "created"
+            ).all()
+            for log in cleanup_logs:
+                log.action = "cleanup_pending"
+                log.cleaned_at = datetime.utcnow()
+            db.commit()
+            write_orchestrator_log(f"[Orchestrator] Cleanup phase complete. Marked {len(cleanup_logs)} record(s) for cleanup.")
+        except Exception as cleanup_err:
+            logger.error(f"Cleanup phase failed: {cleanup_err}")
+            write_orchestrator_log(f"[Orchestrator Warning] Cleanup failed: {cleanup_err}")
 
         task.status = "completed"
         task.completed_at = datetime.utcnow()

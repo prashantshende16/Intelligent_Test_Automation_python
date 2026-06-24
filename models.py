@@ -29,6 +29,8 @@ class Task(Base):
     auth = relationship("TaskAuth", back_populates="task", uselist=False, cascade="all, delete-orphan")
     seeds = relationship("TaskSeed", back_populates="task", uselist=False, cascade="all, delete-orphan")
     agent_states = relationship("AgentState", back_populates="task", cascade="all, delete-orphan")
+    safety_config = relationship("SafetyConfig", back_populates="task", uselist=False, cascade="all, delete-orphan")
+    test_cleanup_logs = relationship("TestCleanupLog", back_populates="task", cascade="all, delete-orphan")
 
 
 class UseCase(Base):
@@ -57,6 +59,7 @@ class TestCase(Base):
     error_message = Column(Text, nullable=True)
     execution_time = Column(Float, nullable=True) # in seconds
     page_url = Column(String, nullable=True)
+    test_type = Column(String, nullable=True) # positive, negative, boundary, security, role_based, performance, accessibility
     created_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("Task", back_populates="test_cases")
@@ -163,5 +166,36 @@ class CodeReference(Base):
     end_line = Column(Integer, nullable=False)
     code_snippet = Column(Text, nullable=False)
     proposed_fix = Column(Text, nullable=True)
+    trace_chain_json = Column(Text, nullable=True) # JSON: [{layer, file/endpoint/table}, ...]
 
     test_error = relationship("TestError", back_populates="code_reference")
+
+
+class SafetyConfig(Base):
+    __tablename__ = "safety_configs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    task_id = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    protected_usernames_json = Column(Text, default='["admin","superadmin","root"]')
+    protected_actions_json = Column(Text, default='["delete","deactivate","change_password","change_role","update"]')
+    enable_safe_mode = Column(Integer, default=1)  # 1 = enabled
+    temp_user_prefix = Column(String, default="test_user_")
+    cleanup_after_test = Column(Integer, default=1)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    task = relationship("Task", back_populates="safety_config")
+
+
+class TestCleanupLog(Base):
+    __tablename__ = "test_cleanup_logs"
+
+    id = Column(String, primary_key=True, default=generate_uuid)
+    task_id = Column(String, ForeignKey("tasks.id", ondelete="CASCADE"), nullable=False)
+    record_type = Column(String, nullable=False)  # "user", "order", etc.
+    record_identifier = Column(String, nullable=False)  # the username/id created
+    action = Column(String, default="created")  # created, deleted, cleanup_pending
+    created_at = Column(DateTime, default=datetime.utcnow)
+    cleaned_at = Column(DateTime, nullable=True)
+
+    task = relationship("Task", back_populates="test_cleanup_logs")
+

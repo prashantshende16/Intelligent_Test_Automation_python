@@ -69,6 +69,15 @@ def ensure_task_columns():
         if "page_url" not in tc_columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE test_cases ADD COLUMN page_url VARCHAR"))
+        if "test_type" not in tc_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE test_cases ADD COLUMN test_type VARCHAR"))
+
+    if "code_references" in inspector.get_table_names():
+        cr_columns = {col["name"] for col in inspector.get_columns("code_references")}
+        if "trace_chain_json" not in cr_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE code_references ADD COLUMN trace_chain_json TEXT"))
 
 ensure_task_columns()
 
@@ -178,13 +187,29 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
         db.add(db_seed)
         
     # Pre-populate Agent states for UI tracking
-    for agent_name in ["Orchestrator", "UI_UX", "Responsive", "Form", "API", "Image", "CodeReview"]:
+    for agent_name in [
+        "Orchestrator", "RouteDiscovery", "HealthCheck", "Login",
+        "RolePermission", "UserJourney", "Form", "API",
+        "DatabaseIntegrity", "Security", "Accessibility", "Responsive",
+        "VisualRegression", "Performance", "CodeCorrelation"
+    ]:
         agent_state = models.AgentState(
             task_id=db_task.id,
             agent_name=agent_name,
             status="pending"
         )
         db.add(agent_state)
+
+    # Pre-populate SafetyConfig
+    db_safety = models.SafetyConfig(
+        task_id=db_task.id,
+        protected_usernames_json='["admin","superadmin","root","administrator","sysadmin"]',
+        protected_actions_json='["delete","deactivate","change_password","change_role","update","edit","modify","reset_password"]',
+        enable_safe_mode=1,
+        temp_user_prefix="test_user_",
+        cleanup_after_test=1
+    )
+    db.add(db_safety)
         
     db.commit()
     db.refresh(db_task)
@@ -373,6 +398,7 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
             "otp_set": bool((auth.auth_otp_code or "").strip()),
             "otp_hint": auth.auth_otp_hint,
         }
+    safety_config = db.query(models.SafetyConfig).filter(models.SafetyConfig.task_id == task_id).first()
     
     return schemas.TaskDetailsResponse(
         task=task_resp,
@@ -384,7 +410,8 @@ def get_task_details(task_id: str, db: Session = Depends(get_db)):
         auth=auth,
         auth_state=auth_state,
         seeds=seeds,
-        agent_states=agent_states
+        agent_states=agent_states,
+        safety_config=safety_config
     )
 
 @app.get("/api/tasks/{task_id}/report.csv")

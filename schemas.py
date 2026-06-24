@@ -83,6 +83,7 @@ class TestCaseResponse(BaseModel):
     error_message: Optional[str] = None
     execution_time: Optional[float] = None
     page_url: Optional[str] = None
+    test_type: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -146,6 +147,7 @@ class CodeReferenceResponse(BaseModel):
     end_line: int
     code_snippet: str
     proposed_fix: Optional[str] = None
+    trace_chain_json: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -175,6 +177,20 @@ class SuggestionResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class SafetyConfigResponse(BaseModel):
+    id: str
+    task_id: str
+    protected_usernames_json: str
+    protected_actions_json: str
+    enable_safe_mode: int
+    temp_user_prefix: str
+    cleanup_after_test: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class TaskDetailsResponse(BaseModel):
     task: TaskResponse
     use_cases: List[UseCaseResponse]
@@ -186,6 +202,11 @@ class TaskDetailsResponse(BaseModel):
     auth_state: Optional[Dict] = None
     seeds: Optional[TaskSeedResponse] = None
     agent_states: List[AgentStateResponse] = []
+    safety_config: Optional[SafetyConfigResponse] = None
+
+    class Config:
+        from_attributes = True
+
 
 class DashboardStats(BaseModel):
     total_tasks: int
