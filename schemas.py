@@ -160,6 +160,7 @@ class TestErrorResponse(BaseModel):
     severity: str
     page_url: str
     screenshot_path: Optional[str] = None
+    video_path: Optional[str] = None
     created_at: datetime
     code_reference: Optional[CodeReferenceResponse] = None
 

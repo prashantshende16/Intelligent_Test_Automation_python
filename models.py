@@ -77,6 +77,7 @@ class TestError(Base):
     severity = Column(String, default="medium") # low, medium, high, critical
     page_url = Column(String, nullable=False)
     screenshot_path = Column(String, nullable=True)
+    video_path = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     task = relationship("Task", back_populates="errors")

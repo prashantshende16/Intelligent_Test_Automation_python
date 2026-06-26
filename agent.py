@@ -2843,6 +2843,9 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
     finally:
         db_sess.close()
 
+    video_dir = os.path.join("videos", task_id)
+    os.makedirs(video_dir, exist_ok=True)
+
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch(headless=True)
         if is_mobile:
@@ -2851,12 +2854,16 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                 user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
                 is_mobile=True,
                 has_touch=True,
-                ignore_https_errors=True
+                ignore_https_errors=True,
+                record_video_dir=video_dir,
+                record_video_size={"width": 1280, "height": 720}
             )
         else:
             context = browser.new_context(
                 ignore_https_errors=True,
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                record_video_dir=video_dir,
+                record_video_size={"width": 1280, "height": 720}
             )
         page = context.new_page()
         page.set_default_timeout(20000)
@@ -2985,8 +2992,33 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                 finally:
                     db.close()
 
+        raw_video_path = None
+        try:
+            if page and page.video:
+                raw_video_path = page.video.path()
+        except Exception as e:
+            logger.warning(f"Could not retrieve video path: {e}")
+
         context.close()
         browser.close()
+
+        if raw_video_path:
+            time.sleep(0.5)
+            if os.path.exists(raw_video_path):
+                filename = os.path.basename(raw_video_path)
+                video_relative_path = os.path.join("videos", task_id, filename)
+                db = SessionLocal()
+                try:
+                    if error_ids:
+                        db.query(TestError).filter(TestError.id.in_(error_ids)).update(
+                            {TestError.video_path: video_relative_path},
+                            synchronize_session=False
+                        )
+                        db.commit()
+                except Exception as db_err:
+                    logger.error(f"Failed to update video_path in DB: {db_err}")
+                finally:
+                    db.close()
 
     return error_ids
 

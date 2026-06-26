@@ -17,3 +17,8 @@ logs/
 
 dist/
 build/
+
+# Media / Videos
+videos/
+*.webm
+*.mp4

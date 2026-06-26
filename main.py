@@ -79,6 +79,12 @@ def ensure_task_columns():
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE code_references ADD COLUMN trace_chain_json TEXT"))
 
+    if "test_errors" in inspector.get_table_names():
+        err_columns = {col["name"] for col in inspector.get_columns("test_errors")}
+        if "video_path" not in err_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE test_errors ADD COLUMN video_path VARCHAR"))
+
 ensure_task_columns()
 
 app = FastAPI(title="AI Website Testing Automation API")
@@ -522,13 +528,14 @@ def download_task_report(task_id: str, db: Session = Depends(get_db)):
         ])
 
     section("Errors")
-    writer.writerow(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "CREATED AT", "TEST CASE ID"])
+    writer.writerow(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "VIDEO", "CREATED AT", "TEST CASE ID"])
     for err in errors:
         writer.writerow([
             err.message,
             err.severity,
             err.page_url,
             err.screenshot_path or "",
+            err.video_path or "",
             err.created_at.isoformat(),
             err.test_case_id or "",
         ])
@@ -810,20 +817,34 @@ def generate_task_report_workbook(task_id: str, db: Session, relative_hyperlinks
 
     # Section 7: Errors
     write_section("Errors")
-    write_headers(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "CREATED AT", "TEST CASE ID"])
+    write_headers(["MESSAGE", "SEVERITY", "PAGE URL", "SCREENSHOT", "VIDEO", "CREATED AT", "TEST CASE ID"])
     for err in errors:
         screenshot_val = err.screenshot_path or ""
+        video_val = err.video_path or ""
+        video_url = ""
+        if video_val:
+            filename = os.path.basename(video_val)
+            if relative_hyperlinks:
+                video_url = f"videos/{filename}"
+            else:
+                video_url = f"http://localhost:8000/api/videos/{task_id}/{filename}"
         write_row([
             err.message,
             err.severity,
             err.page_url,
             screenshot_val,
+            video_url,
             err.created_at,
             err.test_case_id or "",
         ])
+        row_idx = ws.max_row
         if screenshot_val:
-            row_idx = ws.max_row
             embed_screenshot_in_cell(f"D{row_idx}", screenshot_val, row_idx)
+        if video_url:
+            cell = ws[f"E{row_idx}"]
+            cell.value = "Click to view video recording"
+            cell.hyperlink = video_url
+            cell.font = Font(name="Segoe UI", size=10, color="0563C1", underline="single", italic=True)
 
     # Section 8: Suggestions
     write_section("Suggestions")
@@ -922,6 +943,21 @@ def download_task_report_zip(task_id: str, db: Session = Depends(get_db)):
                         zip_file.write(path_to_try, arcname=f"screenshots/{filename}")
                         added_screenshots.add(filename)
 
+        # Write each video to the videos/ folder inside the ZIP
+        added_videos = set()
+        for err in errors:
+            if err.video_path:
+                path_to_try = err.video_path
+                if not os.path.isabs(path_to_try):
+                    path_to_try = os.path.join(backend_dir, err.video_path)
+
+                if os.path.exists(path_to_try) and os.path.isfile(path_to_try):
+                    filename = os.path.basename(path_to_try)
+                    if filename not in added_videos:
+                        # Write to "videos/{filename}" in ZIP
+                        zip_file.write(path_to_try, arcname=f"videos/{filename}")
+                        added_videos.add(filename)
+
     zip_stream.seek(0)
 
     zip_filename = f"{task.id}_test_report.zip"
@@ -956,6 +992,21 @@ def get_screenshot(task_id: str, filename: str):
             return FileResponse(screenshot_path, media_type="image/png")
 
     raise HTTPException(status_code=404, detail="Screenshot not found")
+
+@app.get("/api/videos/{task_id}/{filename}")
+def get_video(task_id: str, filename: str):
+    safe_filename = os.path.basename(filename)
+    candidate_dirs = [
+        os.path.abspath(os.path.join("videos", task_id)),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), "videos", task_id)),
+    ]
+
+    for video_dir in candidate_dirs:
+        video_path = os.path.abspath(os.path.join(video_dir, safe_filename))
+        if video_path.startswith(video_dir) and os.path.isfile(video_path):
+            return FileResponse(video_path, media_type="video/webm")
+
+    raise HTTPException(status_code=404, detail="Video not found")
 
 @app.get("/api/dashboard/stats", response_model=schemas.DashboardStats)
 def get_dashboard_stats(db: Session = Depends(get_db)):
