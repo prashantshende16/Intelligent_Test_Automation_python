@@ -24,6 +24,30 @@ from agent import run_testing_agent, run_test_execution_agent
 # Initialize Database tables
 Base.metadata.create_all(bind=engine)
 
+def reset_stuck_tasks():
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        stuck_tasks = db.query(models.Task).filter(models.Task.status.in_(["crawling", "generating_test_cases", "running_tests", "pending"])).all()
+        for task in stuck_tasks:
+            task.status = "stopped"
+            task.completed_at = datetime.utcnow()
+            
+        stuck_agents = db.query(models.AgentState).filter(models.AgentState.status.in_({"pending", "running"})).all()
+        for state in stuck_agents:
+            state.status = "failed"
+            state.completed_at = datetime.utcnow()
+            
+        if stuck_tasks or stuck_agents:
+            db.commit()
+            print(f"Startup check: Reset {len(stuck_tasks)} stuck tasks and {len(stuck_agents)} active agents to stopped/failed.")
+    except Exception as e:
+        print(f"Failed to reset stuck tasks on startup: {e}")
+    finally:
+        db.close()
+
+reset_stuck_tasks()
+
 def ensure_task_auth_columns():
     inspector = inspect(engine)
     if "task_auths" not in inspector.get_table_names():

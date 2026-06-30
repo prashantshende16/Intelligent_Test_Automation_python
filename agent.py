@@ -794,7 +794,7 @@ def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 24)
     return deduped
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None) -> list:
+def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None, task_id: str = None) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
@@ -824,7 +824,7 @@ def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = N
             page = context.new_page()
             page.set_default_timeout(20000)
             if auth and auth.get("auth_required"):
-                authenticate_browser_context(page, auth, normalized, logger.info)
+                authenticate_browser_context(page, auth, normalized, logger.info, task_id=task_id)
                 try:
                     expand_navigation_regions(page)
                 except Exception:
@@ -837,6 +837,7 @@ def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = N
                     except Exception:
                         pass
                     check_and_click_guest_bypass(page, logger.info)
+                    save_live_screenshot(page, task_id)
                 except Exception:
                     pass
 
@@ -876,6 +877,7 @@ def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = N
                 try:
                     snapshot = extract_page_snapshot(page, current_url, status_code)
                     snapshots.append(snapshot)
+                    save_live_screenshot(page, task_id)
                 except Exception as exc:
                     logger.error(f"Failed to extract snapshot for {current_url}: {exc}")
                     continue
@@ -1321,6 +1323,345 @@ def save_screenshot(page, path: str) -> None:
         logger.warning(f"Screenshot save failed: {exc}")
 
 
+def save_live_screenshot(page, task_id: str) -> None:
+    if not task_id:
+        return
+    try:
+        live_dir = os.path.join("screenshots", task_id)
+        os.makedirs(live_dir, exist_ok=True)
+        live_path = os.path.join(live_dir, "live_preview.png")
+        page.screenshot(path=live_path, full_page=False)
+    except Exception as exc:
+        logger.warning(f"Live preview screenshot save failed: {exc}")
+
+
+def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview_path: str = None, log_callback=None) -> dict:
+    """Discovers input fields on the page, typewrite-fills them sequentially with highlighting and saves live previews."""
+    discover_script = """
+    () => {
+        const fields = [];
+        const labelMap = {};
+        document.querySelectorAll('label').forEach(lbl => {
+            const htmlFor = lbl.getAttribute('for');
+            const text = (lbl.textContent || '').trim().replace(/\\*$/, '').trim();
+            if (htmlFor) labelMap[htmlFor] = text;
+        });
+
+        function getFieldLabel(el) {
+            const id = el.id || '';
+            if (labelMap[id]) return labelMap[id];
+            const parentLabel = el.closest('label');
+            if (parentLabel) return (parentLabel.textContent || '').trim().replace(/\\*$/, '').trim();
+            const placeholder = el.getAttribute('placeholder') || '';
+            if (placeholder) return placeholder;
+            const name = el.getAttribute('name') || '';
+            if (name) return name;
+            
+            let prev = el.previousElementSibling;
+            while (prev) {
+                const text = (prev.textContent || '').trim();
+                if (text && text.length < 50) return text.replace(/\\*$/, '').trim();
+                prev = prev.previousElementSibling;
+            }
+            return '';
+        }
+
+        function getSelector(el) {
+            if (el.id) return `#${CSS.escape(el.id)}`;
+            if (el.name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
+            let path = [];
+            let current = el;
+            while (current && current.nodeType === Node.ELEMENT_NODE) {
+                let selector = current.nodeName.toLowerCase();
+                if (current.id) {
+                    selector += '#' + CSS.escape(current.id);
+                    path.unshift(selector);
+                    break;
+                } else {
+                    let sib = current, nth = 1;
+                    while (sib = sib.previousElementSibling) {
+                        if (sib.nodeName.toLowerCase() == selector) nth++;
+                    }
+                    if (nth != 1) selector += ":nth-of-type("+nth+")";
+                }
+                path.unshift(selector);
+                current = current.parentNode;
+            }
+            return path.join(" > ");
+        }
+
+        // 1. Text inputs
+        const textInputs = document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=file]):not([type=radio]):not([type=checkbox]), textarea');
+        textInputs.forEach(el => {
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) return;
+            const label = getFieldLabel(el);
+            const selector = getSelector(el);
+            fields.push({
+                selector,
+                label,
+                type: el.tagName.toLowerCase() === 'textarea' ? 'textarea' : el.getAttribute('type') || 'text'
+            });
+        });
+
+        // 2. Dropdown Selects
+        document.querySelectorAll('select').forEach(el => {
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) return;
+            const label = getFieldLabel(el) || 'Select Dropdown';
+            const selector = getSelector(el);
+            const options = Array.from(el.options);
+            const validOption = options.find(o => o.value && o.value !== '' && !o.disabled) || options[0];
+            fields.push({
+                selector,
+                label,
+                type: 'select',
+                value: validOption ? validOption.value : '',
+                text: validOption ? validOption.text : ''
+            });
+        });
+
+        // 3. Checkboxes & Radios
+        document.querySelectorAll('input[type="checkbox"], input[type="radio"]').forEach(el => {
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return;
+            if (!el.checked) {
+                const label = getFieldLabel(el) || 'Checkbox/Radio';
+                const selector = getSelector(el);
+                fields.push({
+                    selector,
+                    label,
+                    type: el.getAttribute('type'),
+                    value: 'click'
+                });
+            }
+        });
+
+        // 4. File Inputs
+        const fileInputs = [];
+        document.querySelectorAll('input[type="file"]').forEach((el, idx) => {
+            const label = getFieldLabel(el) || `File Input ${idx+1}`;
+            const selector = getSelector(el);
+            fileInputs.push({ label, selector });
+        });
+
+        // 5. Custom Dropdowns
+        document.querySelectorAll('[role="combobox"], [class*="select-container"], [class*="Select-container"], [class*="-control"], .select, .dropdown').forEach(el => {
+            if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') return;
+            const style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || el.offsetWidth === 0) return;
+            if (el.querySelector('[role="combobox"]') && el !== el.querySelector('[role="combobox"]')) return;
+            
+            const label = getFieldLabel(el) || 'Custom Dropdown';
+            const selector = getSelector(el);
+            fields.push({
+                selector,
+                label,
+                type: 'custom_dropdown',
+                value: 'click'
+            });
+        });
+
+        return { fields, fileInputs };
+    }
+    """
+    
+    filled_fields = {}
+    try:
+        res = page.evaluate(discover_script)
+        fields = res.get("fields", [])
+        file_inputs = res.get("fileInputs", [])
+    except Exception as e:
+        if log_callback:
+            log_callback(f"[Typewriter] Error discovering fields: {e}")
+        return {"filled_fields": {}, "file_inputs": []}
+
+    for field in fields:
+        selector = field["selector"]
+        label = field["label"]
+        ftype = field["type"]
+        label_lower = label.lower()
+        
+        # Determine value to fill
+        val = "QA Test Value"
+        url_lower = page.url.lower()
+        is_login_page = "login" in url_lower or "signin" in url_lower
+        
+        if ftype in ["text", "textarea", "email", "password", "tel", "number", "date"]:
+            placeholder = ""
+            try:
+                placeholder = (page.locator(selector).get_attribute("placeholder") or "").lower()
+            except Exception:
+                pass
+                
+            if is_login_page:
+                if any(k in label_lower or k in placeholder for k in ["email", "username", "user"]):
+                    val = safe_values.get("username") or "admin@gmail.com"
+                elif "pass" in label_lower or "pass" in placeholder:
+                    val = safe_values.get("password") or "Admin@#123"
+            else:
+                if "email" in label_lower or "email" in placeholder:
+                    val = safe_values.get("email") or "test.qa@datagrid.co.in"
+                elif "pass" in label_lower or "pass" in placeholder:
+                    val = safe_values.get("password") or "TestSecure#2026"
+                elif any(k in label_lower or k in placeholder for k in ["phone", "mobile"]):
+                    val = safe_values.get("phone") or "9876543210"
+                elif "year" in label_lower or "year" in placeholder:
+                    val = "2026"
+                elif any(k in label_lower or k in placeholder for k in ["shared on", "date"]) or ftype == "date":
+                    val = "2026-06-18"
+                elif "fund" in label_lower or "fund" in placeholder:
+                    val = "PNS Capital Fund A"
+                elif "company" in label_lower or "company" in placeholder:
+                    val = "Datagrid Investment Company"
+                elif "investor" in label_lower or "investor" in placeholder:
+                    val = "QA Investor Group"
+                elif any(k in label_lower or k in placeholder for k in ["department", "dept"]):
+                    if "desc" in label_lower or "desc" in placeholder:
+                        val = "This department handles visual, responsive, and performance QA automation testing."
+                    else:
+                        val = "Quality Assurance"
+                elif any(k in label_lower or k in placeholder for k in ["description", "desc"]):
+                    val = "This is a sample description generated automatically for testing purposes."
+                elif any(k in label_lower or k in placeholder for k in ["role", "designation"]):
+                    val = "Quality Assurance Lead"
+                elif "address" in label_lower or "address" in placeholder:
+                    val = "404 Innovation Way, Tech Park"
+                elif "city" in label_lower or "city" in placeholder:
+                    val = "Mumbai"
+                elif "state" in label_lower or "state" in placeholder:
+                    val = "Maharashtra"
+                elif any(k in label_lower or k in placeholder for k in ["zip", "pin", "postal"]):
+                    val = "400001"
+                elif "name" in label_lower or "name" in placeholder:
+                    first = safe_values.get("first_name")
+                    last = safe_values.get("last_name")
+                    val = f"{first} {last}" if (first and last) else "QA Test User"
+                elif "url" in label_lower or "url" in placeholder or "link" in label_lower:
+                    val = "https://pns-capital.datagrid.co.in"
+
+            try:
+                # Highlight in blue/purple outline to indicate active focus
+                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #6366f1'")
+                page.locator(selector).focus()
+                page.locator(selector).fill("") # Clear input first
+                
+                # Typewriter type character by character
+                for char in val:
+                    page.keyboard.type(char)
+                    page.wait_for_timeout(35) # small delay per char
+                    if live_preview_path:
+                        page.screenshot(path=live_preview_path, full_page=False)
+
+                # Set success border
+                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #22c55e'")
+                filled_fields[label or "Text Input"] = val
+                page.wait_for_timeout(100)
+            except Exception as fill_err:
+                if log_callback:
+                    log_callback(f"[Typewriter] Warning: Failed to fill text field '{label}': {fill_err}")
+
+        elif ftype == "select":
+            try:
+                sel_val = field["value"]
+                sel_txt = field["text"]
+                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #6366f1'")
+                page.locator(selector).select_option(sel_val)
+                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #22c55e'")
+                filled_fields[label] = sel_txt
+                if live_preview_path:
+                    page.screenshot(path=live_preview_path, full_page=False)
+                page.wait_for_timeout(200)
+            except Exception as select_err:
+                if log_callback:
+                    log_callback(f"[Typewriter] Warning: Failed to select dropdown option '{label}': {select_err}")
+
+        elif ftype in ["checkbox", "radio"]:
+            try:
+                page.locator(selector).click()
+                filled_fields[label] = "Checked"
+                if live_preview_path:
+                    page.screenshot(path=live_preview_path, full_page=False)
+                page.wait_for_timeout(200)
+            except Exception as click_err:
+                if log_callback:
+                    log_callback(f"[Typewriter] Warning: Failed to click checkbox/radio '{label}': {click_err}")
+
+        elif ftype == "custom_dropdown":
+            try:
+                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #6366f1'")
+                page.locator(selector).click()
+                page.wait_for_timeout(400)
+                if live_preview_path:
+                    page.screenshot(path=live_preview_path, full_page=False)
+
+                # Look for option to click
+                options_script = """
+                () => {
+                    const options = Array.from(document.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option, [class*="-menu"] div, li'));
+                    const optionToClick = options.find(opt => {
+                        const optStyle = window.getComputedStyle(opt);
+                        const text = (opt.textContent || '').trim();
+                        return optStyle.display !== 'none' && 
+                               optStyle.visibility !== 'hidden' && 
+                               opt.offsetWidth > 0 &&
+                               text !== '' && 
+                               !text.startsWith('Select') &&
+                               !text.includes('No options') &&
+                               !text.includes('Loading');
+                    });
+                    if (optionToClick) {
+                        function getSelector(el) {
+                            if (el.id) return `#${CSS.escape(el.id)}`;
+                            if (el.name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
+                            let path = [];
+                            let current = el;
+                            while (current && current.nodeType === Node.ELEMENT_NODE) {
+                                let selector = current.nodeName.toLowerCase();
+                                if (current.id) {
+                                    selector += '#' + CSS.escape(current.id);
+                                    path.unshift(selector);
+                                    break;
+                                } else {
+                                    let sib = current, nth = 1;
+                                    while (sib = sib.previousElementSibling) {
+                                        if (sib.nodeName.toLowerCase() == selector) nth++;
+                                    }
+                                    if (nth != 1) selector += ":nth-of-type("+nth+")";
+                                }
+                                path.unshift(selector);
+                                current = current.parentNode;
+                            }
+                            return path.join(" > ");
+                        }
+                        return { selector: getSelector(optionToClick), text: (optionToClick.textContent || '').trim() };
+                    }
+                    return null;
+                }
+                """
+                opt_info = page.evaluate(options_script)
+                if opt_info:
+                    opt_sel = opt_info["selector"]
+                    opt_txt = opt_info["text"]
+                    page.locator(opt_sel).click()
+                    filled_fields[label] = opt_txt
+                else:
+                    page.locator(selector).press("ArrowDown")
+                    page.wait_for_timeout(150)
+                    page.locator(selector).press("Enter")
+                    filled_fields[label] = "Selected Option"
+
+                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #22c55e'")
+                if live_preview_path:
+                    page.screenshot(path=live_preview_path, full_page=False)
+                page.wait_for_timeout(200)
+            except Exception as custom_err:
+                if log_callback:
+                    log_callback(f"[Typewriter] Warning: Failed to fill custom dropdown '{label}': {custom_err}")
+
+    return {"filled_fields": filled_fields, "file_inputs": file_inputs}
+
+
 def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip().lower())
 
@@ -1561,7 +1902,7 @@ def check_and_click_guest_bypass(page, log_callback=None) -> bool:
     return False
 
 
-def authenticate_browser_context(context_or_page, auth: dict, start_url: str, log_callback=None) -> bool:
+def authenticate_browser_context(context_or_page, auth: dict, start_url: str, log_callback=None, task_id: str = None) -> bool:
     """Attempt a lightweight login flow when credentials are provided."""
     if not auth or not auth.get("auth_required"):
         return False
@@ -1589,6 +1930,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
             log_callback(f"[Orchestrator] Attempting authenticated session via {login_url}")
         page.goto(login_url, wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
+        save_live_screenshot(page, task_id)
 
         snapshot = _discover_auth_form(page)
         if _detect_challenge_text(snapshot.get("body_text", ""), page.url):
@@ -1635,6 +1977,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                             if trigger.is_visible():
                                 trigger.click(timeout=3000)
                                 clicked_trigger = True
+                                save_live_screenshot(page, task_id)
                                 break
                         if clicked_trigger:
                             break
@@ -1648,6 +1991,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                 except Exception:
                     page.wait_for_timeout(1500)
                 snapshot = _discover_auth_form(page)
+                save_live_screenshot(page, task_id)
 
         def fill_first(selectors, value):
             for selector in selectors:
@@ -1658,14 +2002,30 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                     el = loc.nth(j)
                     if el.is_visible():
                         try:
-                            el.fill(value, timeout=2000)
+                            el.evaluate("el => el.style.border = '2px solid #6366f1'")
+                            el.focus()
+                            el.fill("")
+                            for char in value:
+                                page.keyboard.type(char)
+                                page.wait_for_timeout(35)
+                                save_live_screenshot(page, task_id)
+                            el.evaluate("el => el.style.border = '2px solid #22c55e'")
+                            page.wait_for_timeout(100)
                             return True
                         except Exception:
                             pass
                 # Fallback to normal first match
                 if count > 0:
                     try:
-                        loc.first.fill(value, timeout=2000)
+                        loc.first.evaluate("el => el.style.border = '2px solid #6366f1'")
+                        loc.first.focus()
+                        loc.first.fill("")
+                        for char in value:
+                            page.keyboard.type(char)
+                            page.wait_for_timeout(35)
+                            save_live_screenshot(page, task_id)
+                        loc.first.evaluate("el => el.style.border = '2px solid #22c55e'")
+                        page.wait_for_timeout(100)
                         return True
                     except Exception:
                         pass
@@ -1807,6 +2167,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                     if btn.is_visible():
                         btn.click(timeout=2000)
                         submitted = True
+                        save_live_screenshot(page, task_id)
                         break
                 if submitted:
                     break
@@ -1821,6 +2182,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                     if loc.count() > 0:
                         loc.first.click(timeout=2000)
                         submitted = True
+                        save_live_screenshot(page, task_id)
                         break
                 except Exception:
                     continue
@@ -1834,6 +2196,7 @@ def authenticate_browser_context(context_or_page, auth: dict, start_url: str, lo
                 page.wait_for_timeout(1000)
             except Exception:
                 pass
+            save_live_screenshot(page, task_id)
 
         snapshot = _discover_auth_form(page)
 
@@ -1980,12 +2343,13 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
             has_login_intended = any(k in url_lower for k in login_keywords)
             if has_login_current and not has_login_intended:
                 logger.info(f"[SelfHealing] Detected login redirect from {url} to {page.url}. Attempting to re-authenticate context.")
-                success = authenticate_browser_context(page, auth, url, logger.info)
+                success = authenticate_browser_context(page, auth, url, logger.info, task_id=task_id)
                 if success:
                     logger.info(f"[SelfHealing] Re-authentication successful. Navigating back to {url}")
                     response = page.goto(url, wait_until="domcontentloaded")
                 else:
                     logger.warning(f"[SelfHealing] Re-authentication failed after redirect to {page.url}")
+        save_live_screenshot(page, task_id)
         return response
 
     task_id = test_data.get("task_id")
@@ -2103,6 +2467,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                 try:
                     submit_btn.click(timeout=3000)
                     page.wait_for_timeout(1000)
+                    save_live_screenshot(page, task_id)
                 except Exception:
                     pass
 
@@ -2325,9 +2690,10 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                         "last_name": "Test User",
                         "phone": "9876543210"
                     }
-                autofill_result = page.evaluate(js_autofill_script, safe_values)
-                filled_data = autofill_result.get("filledFields", {})
-                file_inputs = autofill_result.get("fileInputs", [])
+                live_preview_path = os.path.join("screenshots", task_id, "live_preview.png") if task_id else None
+                autofill_result = autofill_form_typewriter(page, task_id, safe_values, live_preview_path, logger.info)
+                filled_data = autofill_result.get("filled_fields", {})
+                file_inputs = autofill_result.get("file_inputs", [])
 
                 # Log temp records for cleanup
                 if task_id and enable_safe_mode and filled_data:
@@ -2379,6 +2745,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                     submit_btn.click(timeout=4000)
                     submit_btn_clicked = True
                     page.wait_for_timeout(2500)
+                    save_live_screenshot(page, task_id)
                 except Exception:
                     pass
             
@@ -2537,6 +2904,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                     before_url = page.url
                     locator.click(timeout=3000)
                     page.wait_for_timeout(1500)
+                    save_live_screenshot(page, task_id)
                     
                     after_url = page.url
                     if after_url != before_url:
@@ -2544,6 +2912,7 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                         if same_site(after_url, page_url):
                             page.go_back()
                             page.wait_for_timeout(1000)
+                            save_live_screenshot(page, task_id)
                         else:
                             safe_goto(page_url)
                             page.wait_for_timeout(1500)
@@ -2653,7 +3022,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                             }
                             """
                             try:
-                                modal_filled = page.evaluate(autofill_js, safe_values)
+                                live_preview_path = os.path.join("screenshots", task_id, "live_preview.png") if task_id else None
+                                autofill_result = autofill_form_typewriter(page, task_id, safe_values, live_preview_path, logger.info)
+                                modal_filled = autofill_result.get("filled_fields", {})
                                 if task_id and enable_safe_mode and modal_filled:
                                     db = SessionLocal()
                                     try:
@@ -2868,7 +3239,7 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
         page = context.new_page()
         page.set_default_timeout(20000)
         if auth and auth.get("auth_required"):
-            authenticate_browser_context(page, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info)
+            authenticate_browser_context(page, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info, task_id=task_id)
 
         # Check for guest bypass option if no auth is required
         if not (auth and auth.get("auth_required")) and base_url:
@@ -2881,6 +3252,7 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
                 except Exception:
                     pass
                 check_and_click_guest_bypass(page, log_callback)
+                save_live_screenshot(page, task_id)
             except Exception as e:
                 if log_callback:
                     log_callback(f"[GuestBypass] Warning: Failed guest bypass initialization: {e}")
@@ -4836,7 +5208,7 @@ def run_testing_agent(task_id: str):
             db.commit()
             write_orchestrator_log("[Orchestrator] Auto-detected React mobile webview codebase. Enabling Mobile Viewport Emulation automatically.")
 
-        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls, is_mobile=is_mobile, cancel_check=is_cancelled)
+        page_snapshots = discover_pages_with_playwright(task.url, auth=auth_data, seed_urls=seed_urls, is_mobile=is_mobile, cancel_check=is_cancelled, task_id=task_id)
         if is_cancelled():
             return
         auth_issue = (auth_data or {}).get("_codex_auth_issue")
