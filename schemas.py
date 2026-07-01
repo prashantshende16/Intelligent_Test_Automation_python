@@ -9,7 +9,7 @@ class TaskCreate(TaskBase):
     codebase_path: Optional[str] = None
     seed_urls: Optional[List[str]] = None
     is_mobile: Optional[bool] = False
-    ai_model: Optional[str] = "gemini-1.5-flash"
+    ai_model: Optional[str] = "gemini-2.5-flash"
     user_prompt: Optional[str] = None
     custom_use_cases_json: Optional[str] = None
     auth_required: Optional[bool] = False
@@ -46,7 +46,7 @@ class TaskResponse(BaseModel):
     url: str
     status: str
     is_mobile: Optional[bool] = False
-    ai_model: Optional[str] = "gemini-1.5-flash"
+    ai_model: Optional[str] = "gemini-2.5-flash"
     user_prompt: Optional[str] = None
     custom_use_cases_json: Optional[str] = None
     page_snapshots_json: Optional[str] = None

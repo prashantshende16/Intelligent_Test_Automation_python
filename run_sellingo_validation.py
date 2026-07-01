@@ -24,7 +24,7 @@ def main():
             url="https://sellingo.ai",
             status="pending",
             is_mobile=0,
-            ai_model="gemini-1.5-flash",
+            ai_model="gemini-2.5-flash",
             user_prompt="Verify catalog management features: adding, editing, and deleting items. Check custom order pages, form fillings, and modals."
         )
         db.add(task)

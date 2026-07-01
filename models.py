@@ -14,7 +14,7 @@ class Task(Base):
     url = Column(String, nullable=False)
     status = Column(String, default="pending") # pending, crawling, generating_test_cases, running_tests, completed, failed
     is_mobile = Column(Integer, default=0) # 0 = desktop, 1 = mobile
-    ai_model = Column(String, default="gemini-1.5-flash")
+    ai_model = Column(String, default="gemini-2.5-flash")
     user_prompt = Column(Text, nullable=True)
     custom_use_cases_json = Column(Text, nullable=True)
     page_snapshots_json = Column(Text, nullable=True)

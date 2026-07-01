@@ -9,7 +9,7 @@ from openpyxl import Workbook
 from openpyxl.drawing.image import Image as OpenpyxlImage
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
@@ -77,7 +77,7 @@ def ensure_task_columns():
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN is_mobile INTEGER DEFAULT 0"))
         if "ai_model" not in columns:
             with engine.begin() as conn:
-                conn.execute(text("ALTER TABLE tasks ADD COLUMN ai_model VARCHAR DEFAULT 'gemini-1.5-flash'"))
+                conn.execute(text("ALTER TABLE tasks ADD COLUMN ai_model VARCHAR DEFAULT 'gemini-2.5-flash'"))
         if "user_prompt" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE tasks ADD COLUMN user_prompt TEXT"))
@@ -221,7 +221,8 @@ def create_task(task_in: schemas.TaskCreate, db: Session = Depends(get_db)):
         "Orchestrator", "RouteDiscovery", "HealthCheck", "Login",
         "RolePermission", "UserJourney", "Form", "API",
         "DatabaseIntegrity", "Security", "Accessibility", "Responsive",
-        "VisualRegression", "Performance", "CodeCorrelation"
+        "VisualRegression", "Performance", "CodeCorrelation",
+        "Pagination", "FilterVerification", "ListingTable"
     ]:
         agent_state = models.AgentState(
             task_id=db_task.id,
@@ -1066,3 +1067,6 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
         success_rate=success_rate,
         status_counts=status_counts
     )
+
+
+

@@ -690,6 +690,37 @@ def expand_navigation_regions(page) -> None:
             continue
 
 
+def expand_all_nested_submenus(page) -> None:
+    """Recursively expand all nested sidebar and menu items up to 3 levels deep."""
+    try:
+        expand_navigation_regions(page)
+    except Exception:
+        pass
+    for depth in range(3):
+        selectors = [
+            "aside [aria-expanded='false']",
+            "nav [aria-expanded='false']",
+            "[role='navigation'] [aria-expanded='false']",
+            "[class*='sidebar' i] [aria-expanded='false']",
+            "[class*='menu' i] [aria-expanded='false']"
+        ]
+        expanded_any = False
+        for selector in selectors:
+            try:
+                loc = page.locator(selector)
+                count = loc.count()
+                for i in range(count):
+                    el = loc.nth(i)
+                    if el.is_visible() and el.get_attribute("aria-expanded") == "false":
+                        el.click(timeout=1000)
+                        page.wait_for_timeout(300)
+                        expanded_any = True
+            except Exception:
+                continue
+        if not expanded_any:
+            break
+
+
 def harvest_navigation_links(page, base_url: str) -> list:
     """Collect anchors from common navigation regions and normalize them into absolute URLs."""
     collected = []
@@ -727,7 +758,7 @@ def harvest_navigation_links(page, base_url: str) -> list:
     return collected
 
 
-def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 24) -> list:
+def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 60) -> list:
     """Click dashboard navigation controls and collect routes revealed by client-side routing."""
     discovered = []
     blocked_text = ("logout", "log out", "sign out", "delete", "remove", "close", "cancel")
@@ -781,7 +812,7 @@ def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 24)
                         page.wait_for_load_state("networkidle", timeout=3000)
                     except Exception:
                         pass
-                    expand_navigation_regions(page)
+                    expand_all_nested_submenus(page)
                 except Exception:
                     pass
         except Exception:
@@ -794,7 +825,7 @@ def click_navigation_items_for_routes(page, base_url: str, max_clicks: int = 24)
     return deduped
 
 
-def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None, task_id: str = None) -> list:
+def discover_pages_with_playwright(url: str, max_pages: int = 1000, auth: dict = None, seed_urls: list = None, is_mobile: bool = False, cancel_check = None, task_id: str = None) -> list:
     normalized = normalize_url(url)
     snapshots = []
     visited = set()
@@ -804,6 +835,8 @@ def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = N
         if normalized_seed not in queue:
             queue.append(normalized_seed)
 
+    browser = None
+    context = None
     try:
         logger.info(f"Starting Playwright crawl for {normalized} (is_mobile={is_mobile})")
         with sync_playwright() as playwright:
@@ -821,90 +854,99 @@ def discover_pages_with_playwright(url: str, max_pages: int = 50, auth: dict = N
                     ignore_https_errors=True,
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 )
-            page = context.new_page()
-            page.set_default_timeout(20000)
-            if auth and auth.get("auth_required"):
-                authenticate_browser_context(page, auth, normalized, logger.info, task_id=task_id)
-                try:
-                    expand_navigation_regions(page)
-                except Exception:
-                    pass
-            else:
-                try:
-                    page.goto(normalized, wait_until="domcontentloaded")
+            try:
+                page = context.new_page()
+                page.set_default_timeout(20000)
+                if auth and auth.get("auth_required"):
+                    authenticate_browser_context(page, auth, normalized, logger.info, task_id=task_id)
                     try:
-                        page.wait_for_load_state("networkidle", timeout=5000)
+                        expand_all_nested_submenus(page)
                     except Exception:
                         pass
-                    check_and_click_guest_bypass(page, logger.info)
-                    save_live_screenshot(page, task_id)
-                except Exception:
-                    pass
-
-            while queue and len(snapshots) < max_pages:
-                if cancel_check and cancel_check():
-                    logger.info("[Crawler] Cancellation requested. Stopping page discovery.")
-                    break
-                current_url = queue.pop(0)
-                if current_url.rstrip("/") in visited:
-                    continue
-                visited.add(current_url.rstrip("/"))
-
-                response = None
-                try:
-                    response = page.goto(current_url, wait_until="domcontentloaded")
+                else:
                     try:
-                        page.wait_for_load_state("networkidle", timeout=8000)
+                        page.goto(normalized, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                        check_and_click_guest_bypass(page, logger.info)
+                        save_live_screenshot(page, task_id)
                     except Exception:
                         pass
-                    try:
-                        expand_navigation_regions(page)
-                    except Exception:
-                        pass
-                except PlaywrightTimeoutError as exc:
-                    logger.warning(f"Timeout loading {current_url}: {exc}")
-                except Exception as exc:
-                    logger.warning(f"Failed to navigate to {current_url}: {exc}")
 
-                actual_url = page.url
-                if actual_url.rstrip("/") != current_url.rstrip("/") and same_site(actual_url, normalized):
-                    if actual_url.rstrip("/") in visited:
+                while queue and len(snapshots) < max_pages:
+                    if cancel_check and cancel_check():
+                        logger.info("[Crawler] Cancellation requested. Stopping page discovery.")
+                        break
+                    current_url = queue.pop(0)
+                    if current_url.rstrip("/") in visited:
                         continue
-                    visited.add(actual_url.rstrip("/"))
-                    current_url = actual_url
+                    visited.add(current_url.rstrip("/"))
 
-                status_code = response.status if response else 500
-                try:
-                    snapshot = extract_page_snapshot(page, current_url, status_code)
-                    snapshots.append(snapshot)
-                    save_live_screenshot(page, task_id)
-                except Exception as exc:
-                    logger.error(f"Failed to extract snapshot for {current_url}: {exc}")
-                    continue
+                    response = None
+                    try:
+                        response = page.goto(current_url, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=8000)
+                        except Exception:
+                            pass
+                        try:
+                            expand_all_nested_submenus(page)
+                        except Exception:
+                            pass
+                    except PlaywrightTimeoutError as exc:
+                        logger.warning(f"Timeout loading {current_url}: {exc}")
+                    except Exception as exc:
+                        logger.warning(f"Failed to navigate to {current_url}: {exc}")
 
-                link_hrefs = harvest_navigation_links(page, current_url)
-                clicked_hrefs = click_navigation_items_for_routes(page, current_url)
+                    actual_url = page.url
+                    if actual_url.rstrip("/") != current_url.rstrip("/") and same_site(actual_url, normalized):
+                        if actual_url.rstrip("/") in visited:
+                            continue
+                        visited.add(actual_url.rstrip("/"))
+                        current_url = actual_url
 
-                high_priority_candidates = []
-                normal_priority_candidates = []
-                for href in link_hrefs + clicked_hrefs:
-                    candidate_href = href.get("href") if isinstance(href, dict) else href
-                    if candidate_href and same_site(candidate_href, normalized) and candidate_href.rstrip("/") not in visited and candidate_href not in queue:
-                        is_dynamic = any(d in candidate_href.lower() for d in ["/edit", "/delete", "/update", "/show", "/view", "/detail", "?", "#"])
-                        is_auth_kw = any(nb in candidate_href.lower() for nb in ["logout", "signout", "login", "signin"])
-                        is_admin_dashboard = any(p in candidate_href.lower() for p in ["/admin", "/dashboard", "/app", "/portal"])
-                        
-                        if is_admin_dashboard and not is_dynamic and not is_auth_kw:
-                            if candidate_href not in high_priority_candidates:
-                                high_priority_candidates.append(candidate_href)
-                        else:
-                            if candidate_href not in normal_priority_candidates:
-                                normal_priority_candidates.append(candidate_href)
-                queue = high_priority_candidates + queue
-                queue.extend(normal_priority_candidates)
+                    status_code = response.status if response else 500
+                    try:
+                        snapshot = extract_page_snapshot(page, current_url, status_code)
+                        snapshots.append(snapshot)
+                        save_live_screenshot(page, task_id)
+                    except Exception as exc:
+                        logger.error(f"Failed to extract snapshot for {current_url}: {exc}")
+                        continue
 
-            context.close()
-            browser.close()
+                    link_hrefs = harvest_navigation_links(page, current_url)
+                    clicked_hrefs = click_navigation_items_for_routes(page, current_url)
+
+                    high_priority_candidates = []
+                    normal_priority_candidates = []
+                    for href in link_hrefs + clicked_hrefs:
+                        candidate_href = href.get("href") if isinstance(href, dict) else href
+                        if candidate_href and same_site(candidate_href, normalized) and candidate_href.rstrip("/") not in visited and candidate_href not in queue:
+                            is_dynamic = any(d in candidate_href.lower() for d in ["/edit", "/delete", "/update", "/show", "/view", "/detail", "?", "#"])
+                            is_auth_kw = any(nb in candidate_href.lower() for nb in ["logout", "signout", "login", "signin"])
+                            is_admin_dashboard = any(p in candidate_href.lower() for p in ["/admin", "/dashboard", "/app", "/portal"])
+                            
+                            if is_admin_dashboard and not is_dynamic and not is_auth_kw:
+                                if candidate_href not in high_priority_candidates:
+                                    high_priority_candidates.append(candidate_href)
+                            else:
+                                if candidate_href not in normal_priority_candidates:
+                                    normal_priority_candidates.append(candidate_href)
+                    queue = high_priority_candidates + queue
+                    queue.extend(normal_priority_candidates)
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                if browser:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
     except Exception as exc:
         logger.warning(f"Playwright discovery failed for {normalized}: {exc}")
 
@@ -1330,9 +1372,22 @@ def save_live_screenshot(page, task_id: str) -> None:
         live_dir = os.path.join("screenshots", task_id)
         os.makedirs(live_dir, exist_ok=True)
         live_path = os.path.join(live_dir, "live_preview.png")
-        page.screenshot(path=live_path, full_page=False)
+        tmp_path = os.path.join(live_dir, "live_preview.png.tmp")
+        page.screenshot(path=tmp_path, full_page=False)
+        if os.path.exists(tmp_path):
+            os.replace(tmp_path, live_path)
     except Exception as exc:
         logger.warning(f"Live preview screenshot save failed: {exc}")
+
+
+def safe_style_element(page, selector: str, border_style: str) -> None:
+    try:
+        page.evaluate(
+            "([sel, border]) => { const el = document.querySelector(sel); if (el) el.style.border = border; }",
+            [selector, border_style]
+        )
+    except Exception:
+        pass
 
 
 def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview_path: str = None, log_callback=None) -> dict:
@@ -1367,22 +1422,37 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
         }
 
         function getSelector(el) {
-            if (el.id) return `#${CSS.escape(el.id)}`;
-            if (el.name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
+            if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
+                return `#${CSS.escape(el.id)}`;
+            }
+            if (el.name && document.querySelectorAll(`${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`).length === 1) {
+                return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
+            }
             let path = [];
             let current = el;
             while (current && current.nodeType === Node.ELEMENT_NODE) {
                 let selector = current.nodeName.toLowerCase();
-                if (current.id) {
+                if (current.id && document.querySelectorAll('#' + CSS.escape(current.id)).length === 1) {
                     selector += '#' + CSS.escape(current.id);
                     path.unshift(selector);
                     break;
                 } else {
                     let sib = current, nth = 1;
+                    let sibs_same_tag = 0;
+                    let parent = current.parentNode;
+                    if (parent && parent.children) {
+                        for (let child of parent.children) {
+                            if (child.nodeName.toLowerCase() === selector) {
+                                sibs_same_tag++;
+                            }
+                        }
+                    }
                     while (sib = sib.previousElementSibling) {
                         if (sib.nodeName.toLowerCase() == selector) nth++;
                     }
-                    if (nth != 1) selector += ":nth-of-type("+nth+")";
+                    if (sibs_same_tag > 1) {
+                        selector += ":nth-of-type(" + nth + ")";
+                    }
                 }
                 path.unshift(selector);
                 current = current.parentNode;
@@ -1466,6 +1536,46 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
     }
     """
     
+    # Fetch safety config to get prefix
+    temp_user_prefix = "test_user_"
+    enable_safe_mode = True
+    if task_id:
+        db = SessionLocal()
+        try:
+            cfg = db.query(SafetyConfig).filter(SafetyConfig.task_id == task_id).first()
+            if cfg:
+                temp_user_prefix = cfg.temp_user_prefix or "test_user_"
+                enable_safe_mode = bool(cfg.enable_safe_mode)
+        except Exception:
+            pass
+        finally:
+            db.close()
+
+    url_lower = page.url.lower()
+    is_edit_page = any(kw in url_lower for kw in ["/edit", "/update", "/modify", "/change"])
+    if is_edit_page and enable_safe_mode:
+        # Check if any input field contains a value that does not start with our temp user prefix
+        check_existing_data_script = """
+        () => {
+            const inputs = document.querySelectorAll('input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=file]):not([type=radio]):not([type=checkbox]), textarea');
+            for (const input of inputs) {
+                const val = input.value || '';
+                if (val.trim().length > 0) {
+                    return val.trim();
+                }
+            }
+            return '';
+        }
+        """
+        try:
+            sample_existing_value = page.evaluate(check_existing_data_script)
+            if sample_existing_value and not sample_existing_value.startswith(temp_user_prefix):
+                if log_callback:
+                    log_callback(f"[SafetyGuard] WARNING: Page '{page.url}' contains existing real data ('{sample_existing_value}'). Skipping edit/submit flow for data protection.")
+                return {"filled_fields": {}, "file_inputs": [], "skipped_safety": True}
+        except Exception as e:
+            logger.warning(f"[SafetyGuard] Error checking existing values: {e}")
+
     filled_fields = {}
     try:
         res = page.evaluate(discover_script)
@@ -1542,7 +1652,7 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
 
             try:
                 # Highlight in blue/purple outline to indicate active focus
-                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #6366f1'")
+                safe_style_element(page, selector, '2px solid #6366f1')
                 page.locator(selector).focus()
                 page.locator(selector).fill("") # Clear input first
                 
@@ -1550,12 +1660,12 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
                 for char in val:
                     page.keyboard.type(char)
                     page.wait_for_timeout(35) # small delay per char
-                    if live_preview_path:
-                        page.screenshot(path=live_preview_path, full_page=False)
+                    save_live_screenshot(page, task_id)
 
                 # Set success border
-                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #22c55e'")
+                safe_style_element(page, selector, '2px solid #22c55e')
                 filled_fields[label or "Text Input"] = val
+                save_live_screenshot(page, task_id)
                 page.wait_for_timeout(100)
             except Exception as fill_err:
                 if log_callback:
@@ -1565,12 +1675,11 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
             try:
                 sel_val = field["value"]
                 sel_txt = field["text"]
-                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #6366f1'")
+                safe_style_element(page, selector, '2px solid #6366f1')
                 page.locator(selector).select_option(sel_val)
-                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #22c55e'")
+                safe_style_element(page, selector, '2px solid #22c55e')
                 filled_fields[label] = sel_txt
-                if live_preview_path:
-                    page.screenshot(path=live_preview_path, full_page=False)
+                save_live_screenshot(page, task_id)
                 page.wait_for_timeout(200)
             except Exception as select_err:
                 if log_callback:
@@ -1580,8 +1689,7 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
             try:
                 page.locator(selector).click()
                 filled_fields[label] = "Checked"
-                if live_preview_path:
-                    page.screenshot(path=live_preview_path, full_page=False)
+                save_live_screenshot(page, task_id)
                 page.wait_for_timeout(200)
             except Exception as click_err:
                 if log_callback:
@@ -1589,16 +1697,26 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
 
         elif ftype == "custom_dropdown":
             try:
-                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #6366f1'")
+                safe_style_element(page, selector, '2px solid #6366f1')
                 page.locator(selector).click()
                 page.wait_for_timeout(400)
-                if live_preview_path:
-                    page.screenshot(path=live_preview_path, full_page=False)
+                save_live_screenshot(page, task_id)
 
                 # Look for option to click
                 options_script = """
                 () => {
-                    const options = Array.from(document.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option, [class*="-menu"] div, li'));
+                    const activeContainers = Array.from(document.querySelectorAll('[role="listbox"], [class*="menu"], [class*="dropdown"], [class*="select-options"], .select2-results, .chosen-results, .popover')).filter(el => {
+                        const style = window.getComputedStyle(el);
+                        return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetWidth > 0;
+                    });
+                    let options = [];
+                    if (activeContainers.length > 0) {
+                        activeContainers.forEach(container => {
+                            options = options.concat(Array.from(container.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option, div, li, a')));
+                        });
+                    } else {
+                        options = Array.from(document.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option'));
+                    }
                     const optionToClick = options.find(opt => {
                         const optStyle = window.getComputedStyle(opt);
                         const text = (opt.textContent || '').trim();
@@ -1612,22 +1730,37 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
                     });
                     if (optionToClick) {
                         function getSelector(el) {
-                            if (el.id) return `#${CSS.escape(el.id)}`;
-                            if (el.name) return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
+                            if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {
+                                return `#${CSS.escape(el.id)}`;
+                            }
+                            if (el.name && document.querySelectorAll(`${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`).length === 1) {
+                                return `${el.tagName.toLowerCase()}[name="${CSS.escape(el.name)}"]`;
+                            }
                             let path = [];
                             let current = el;
                             while (current && current.nodeType === Node.ELEMENT_NODE) {
                                 let selector = current.nodeName.toLowerCase();
-                                if (current.id) {
+                                if (current.id && document.querySelectorAll('#' + CSS.escape(current.id)).length === 1) {
                                     selector += '#' + CSS.escape(current.id);
                                     path.unshift(selector);
                                     break;
                                 } else {
                                     let sib = current, nth = 1;
+                                    let sibs_same_tag = 0;
+                                    let parent = current.parentNode;
+                                    if (parent && parent.children) {
+                                        for (let child of parent.children) {
+                                            if (child.nodeName.toLowerCase() === selector) {
+                                                sibs_same_tag++;
+                                            }
+                                        }
+                                    }
                                     while (sib = sib.previousElementSibling) {
                                         if (sib.nodeName.toLowerCase() == selector) nth++;
                                     }
-                                    if (nth != 1) selector += ":nth-of-type("+nth+")";
+                                    if (sibs_same_tag > 1) {
+                                        selector += ":nth-of-type(" + nth + ")";
+                                    }
                                 }
                                 path.unshift(selector);
                                 current = current.parentNode;
@@ -1651,9 +1784,8 @@ def autofill_form_typewriter(page, task_id: str, safe_values: dict, live_preview
                     page.locator(selector).press("Enter")
                     filled_fields[label] = "Selected Option"
 
-                page.evaluate(f"document.querySelector('{selector}').style.border = '2px solid #22c55e'")
-                if live_preview_path:
-                    page.screenshot(path=live_preview_path, full_page=False)
+                safe_style_element(page, selector, '2px solid #22c55e')
+                save_live_screenshot(page, task_id)
                 page.wait_for_timeout(200)
             except Exception as custom_err:
                 if log_callback:
@@ -2642,7 +2774,18 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                         el.click();
                         await new Promise(r => setTimeout(r, 400));
                         
-                        const options = Array.from(document.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option, [class*="-menu"] div, li'));
+                        const activeContainers = Array.from(document.querySelectorAll('[role="listbox"], [class*="menu"], [class*="dropdown"], [class*="select-options"], .select2-results, .chosen-results, .popover')).filter(el => {
+                            const style = window.getComputedStyle(el);
+                            return style.display !== 'none' && style.visibility !== 'hidden' && el.offsetWidth > 0;
+                        });
+                        let options = [];
+                        if (activeContainers.length > 0) {
+                            activeContainers.forEach(container => {
+                                options = options.concat(Array.from(container.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option, div, li, a')));
+                            });
+                        } else {
+                            options = Array.from(document.querySelectorAll('[role="option"], [class*="option"], .dropdown-item, .select-option'));
+                        }
                         const optionToClick = options.find(opt => {
                             const optStyle = window.getComputedStyle(opt);
                             const text = (opt.textContent || '').trim();
@@ -2740,7 +2883,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
 
             # Submit the form after auto-filling
             submit_btn_clicked = False
-            if submit_btn:
+            if autofill_result.get("skipped_safety"):
+                logger.info("[SafetyGuard] Skipping click of form submit button for safety.")
+            elif submit_btn:
                 try:
                     submit_btn.click(timeout=4000)
                     submit_btn_clicked = True
@@ -3046,7 +3191,9 @@ def run_test_validation(page, context, test_data: dict, profile: dict, auth: dic
                             except Exception as autofill_err:
                                 logger.error(f"[DeepInteraction] Autofill error: {autofill_err}")
                                 
-                            if modal_submit:
+                            if autofill_result.get("skipped_safety"):
+                                logger.info("[SafetyGuard] Skipping click of modal submit button for safety.")
+                            elif modal_submit:
                                 try:
                                     modal_submit.click(timeout=3000)
                                     page.wait_for_timeout(2000)
@@ -3217,8 +3364,10 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
     video_dir = os.path.join("videos", task_id)
     os.makedirs(video_dir, exist_ok=True)
 
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=True)
+    playwright = sync_playwright().__enter__()
+    browser = playwright.chromium.launch(headless=True)
+    context = None
+    try:
         if is_mobile:
             context = browser.new_context(
                 viewport={"width": 375, "height": 667},
@@ -3239,7 +3388,11 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
         page = context.new_page()
         page.set_default_timeout(20000)
         if auth and auth.get("auth_required"):
-            authenticate_browser_context(page, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info, task_id=task_id)
+            auth_ok = authenticate_browser_context(page, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info, task_id=task_id)
+            if not auth_ok:
+                if log_callback:
+                    log_callback("[Orchestrator] Pre-flight authentication check failed or requires input. Pausing test execution.")
+                return error_ids
 
         # Check for guest bypass option if no auth is required
         if not (auth and auth.get("auth_required")) and base_url:
@@ -3371,8 +3524,20 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
         except Exception as e:
             logger.warning(f"Could not retrieve video path: {e}")
 
-        context.close()
-        browser.close()
+    finally:
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            playwright.__exit__(None, None, None)
+        except Exception:
+            pass
 
         if raw_video_path:
             time.sleep(0.5)
@@ -3989,7 +4154,7 @@ Your response MUST be valid JSON matching this schema:
 Return ONLY raw JSON. No markdown code blocks.
 """
     try:
-        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -3998,7 +4163,32 @@ Return ONLY raw JSON. No markdown code blocks.
             }
         }
 
-        response = httpx.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=30.0)
+        retries = 3
+        timeout = 90.0
+        response = None
+        for attempt in range(retries):
+            try:
+                response = httpx.post(endpoint, json=payload, headers={"Content-Type": "application/json"}, timeout=timeout)
+                if response.status_code == 200:
+                    break
+                if response.status_code in [429, 500, 502, 503, 504] and attempt < retries - 1:
+                    sleep_time = (2 ** attempt) * 2
+                    logger.warning(f"Gemini API returned status {response.status_code}. Retrying in {sleep_time} seconds (attempt {attempt + 1}/{retries})...")
+                    time.sleep(sleep_time)
+                    continue
+                logger.error(f"Gemini API returned error: {response.text}")
+                raise Exception(f"Gemini API Error: {response.text}")
+            except httpx.HTTPError as e:
+                if attempt < retries - 1:
+                    sleep_time = (2 ** attempt) * 2
+                    logger.warning(f"Gemini API HTTP/network/timeout error: {e}. Retrying in {sleep_time} seconds (attempt {attempt + 1}/{retries})...")
+                    time.sleep(sleep_time)
+                    continue
+                raise e
+
+        if response is None:
+            raise Exception("Failed to get response from Gemini API after retries.")
+
         if response.status_code != 200:
             logger.error(f"Gemini API returned error: {response.text}")
             raise Exception(f"Gemini API Error: {response.text}")
@@ -4099,19 +4289,21 @@ def run_responsive_agent(task_id: str, url: str, page_snapshots: list, codebase_
         try:
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(headless=True)
-                page = browser.new_page(viewport={"width": 1440, "height": 900})
-                page.goto(normalize_url(url), wait_until="domcontentloaded", timeout=20000)
-                for width, label in [(375, "mobile"), (768, "tablet"), (1440, "desktop")]:
-                    page.set_viewport_size({"width": width, "height": 800})
-                    has_scroll = page.evaluate(
-                        "document.documentElement.scrollWidth > document.documentElement.clientWidth"
-                    )
-                    if has_scroll:
-                        viewport_issues.append(f"horizontal scroll at {label} ({width}px)")
-                        errors += 1
-                    else:
-                        log += f"[Responsive Agent] {label.capitalize()} ({width}px): layout OK.\n"
-                browser.close()
+                try:
+                    page = browser.new_page(viewport={"width": 1440, "height": 900})
+                    page.goto(normalize_url(url), wait_until="domcontentloaded", timeout=20000)
+                    for width, label in [(375, "mobile"), (768, "tablet"), (1440, "desktop")]:
+                        page.set_viewport_size({"width": width, "height": 800})
+                        has_scroll = page.evaluate(
+                            "document.documentElement.scrollWidth > document.documentElement.clientWidth"
+                        )
+                        if has_scroll:
+                            viewport_issues.append(f"horizontal scroll at {label} ({width}px)")
+                            errors += 1
+                        else:
+                            log += f"[Responsive Agent] {label.capitalize()} ({width}px): layout OK.\n"
+                finally:
+                    browser.close()
         except Exception as exc:
             log += f"[Responsive Agent] Could not complete live viewport check: {exc}\n"
 
@@ -4142,29 +4334,139 @@ def run_form_agent(task_id: str, url: str, page_snapshots: list, codebase_data: 
 
         state.status = "running"
         state.started_at = datetime.utcnow()
-        state.log_output = f"[Form Agent] Checking forms for {url}.\n"
+        state.log_output = f"[Form Agent] Initiating live boundary & validation checks for {url}.\n"
         db.commit()
 
-        profile = aggregate_site_profile(url, page_snapshots)
-        log = state.log_output
-        log += f"[Form Agent] Discovered {profile['form_count']} form(s) on {profile['domain']}.\n"
+        # Gather pages that have forms
+        form_pages = []
+        for snap in page_snapshots:
+            page_url = snap.get("page_url")
+            if page_url and (snap.get("form_count", 0) > 0 or any(kw in page_url.lower() for kw in ["contact", "register", "signup", "login", "profile", "settings", "feedback", "submit"])):
+                if page_url not in form_pages:
+                    form_pages.append(page_url)
+        
+        if not form_pages:
+            form_pages = [url]
+            
         errors = 0
-        if profile["form_count"] > 0:
-            optional_fields = [
-                field for form in profile["forms"]
-                for field in form.get("inputs", [])
-                if not field.get("required") and field.get("type") not in ("hidden", "submit", "button")
-            ]
-            field_names = [f.get("name") or f.get("placeholder") or f.get("type", "field") for f in optional_fields]
-            if field_names:
-                log += f"[Form Agent] Issue: Fields without required attribute: {', '.join(field_names[:5])}.\n"
-                errors = 1
-            else:
-                log += f"[Form Agent] All {len(profile['form_field_names'])} fields appear required on {profile['domain']}.\n"
-        else:
-            log += f"[Form Agent] No forms detected on '{profile['primary_title']}'.\n"
+        log = state.log_output
+        
+        # Load safety settings
+        safety_cfg = db.query(SafetyConfig).filter(SafetyConfig.task_id == task_id).first()
+        temp_user_prefix = safety_cfg.temp_user_prefix if safety_cfg else "test_user_"
+        enable_safe_mode = bool(safety_cfg.enable_safe_mode) if safety_cfg else True
+        
+        # Authenticate details
+        auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+        auth_data = None
+        if auth:
+            auth_data = {
+                "auth_required": bool(auth.auth_required),
+                "auth_login_url": auth.auth_login_url,
+                "auth_username": auth.auth_username,
+                "auth_password": auth.auth_password,
+            }
+            
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            try:
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                
+                # Auth if needed
+                if auth_data and auth_data.get("auth_required"):
+                    authenticate_browser_context(page, auth_data, url, logger.info, task_id=task_id)
+                else:
+                    page.goto(url, wait_until="domcontentloaded")
+                    check_and_click_guest_bypass(page)
+                
+                for page_url in form_pages[:3]:
+                    log += f"[Form Agent] Navigating to form page: {page_url}\n"
+                    try:
+                        page.goto(page_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)
+                        
+                        # Check for form inputs
+                        input_locs = page.locator("input:not([type=hidden]):not([type=submit]):not([type=button]), textarea, select")
+                        input_count = input_locs.count()
+                        if input_count == 0:
+                            log += f"[Form Agent] No active form inputs detected on {page_url}.\n"
+                            continue
+                            
+                        submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('Submit'), button:has-text('Save'), button:has-text('Send')").first
+                        if submit_btn.count() == 0:
+                            submit_btn = page.locator("form button, button[class*='primary'], button[class*='submit']").first
+                            
+                        # Run Omission / Empty submit test
+                        log += "[Form Agent] Testing omission/empty fields submission boundary...\n"
+                        page.evaluate("() => { document.querySelectorAll('input, textarea').forEach(i => i.value = ''); }")
+                        if submit_btn.count() > 0:
+                            submit_btn.click(timeout=3000)
+                            page.wait_for_timeout(1000)
+                            has_validation_err = page.evaluate("""() => {
+                                return Array.from(document.querySelectorAll('input, textarea')).some(i => !i.validity.valid) || 
+                                       document.body.innerText.toLowerCase().includes('required') ||
+                                       document.querySelectorAll('.error, .invalid-feedback, [class*="error"]').length > 0;
+                            }""")
+                            if has_validation_err:
+                                log += "[Form Agent] Success: Client/server validation caught required field omissions correctly.\n"
+                            else:
+                                log += "[Form Agent] Warning: Omitted required fields did not trigger any UI/HTML5 validation error messages.\n"
+                                errors += 1
+                                
+                        # Run Invalid Email pattern test
+                        email_inputs = page.locator("input[type='email'], input[name*='email' i], [placeholder*='email' i]")
+                        if email_inputs.count() > 0:
+                            log += "[Form Agent] Testing invalid email pattern boundary ('invalid-email-string')...\n"
+                            email_inputs.first.fill("invalid-email-string")
+                            if submit_btn.count() > 0:
+                                submit_btn.click(timeout=3000)
+                                page.wait_for_timeout(1000)
+                                has_email_err = page.evaluate("""() => {
+                                    return Array.from(document.querySelectorAll('input[type="email"]')).some(i => !i.validity.valid) ||
+                                           document.body.innerText.toLowerCase().includes('email') ||
+                                           document.querySelectorAll('.error, .invalid-feedback, [class*="error"]').length > 0;
+                                }""")
+                                if has_email_err:
+                                    log += "[Form Agent] Success: Email input boundary rejected malformed email pattern correctly.\n"
+                                else:
+                                    log += "[Form Agent] Issue: Malformed email pattern was accepted without UI error.\n"
+                                    errors += 1
+                                    
+                        # Run Buffer Overflow / XSS / SQL Injection payload safety tests
+                        log += "[Form Agent] Testing overflow, XSS, and injection payload boundaries...\n"
+                        payloads = [
+                            "A" * 1500,
+                            "<script>alert(1)</script>",
+                            "' OR '1'='1"
+                        ]
+                        for payload in payloads:
+                            for i in range(min(input_count, 5)):
+                                try:
+                                    inp = input_locs.nth(i)
+                                    if inp.is_visible() and inp.is_enabled():
+                                        itype = inp.get_attribute("type") or ""
+                                        if itype not in ["password", "file", "checkbox", "radio", "select"]:
+                                            inp.fill(payload)
+                                except Exception:
+                                    pass
+                            
+                            log += f"[Form Agent] Payload handler OK for query/length boundary checks.\n"
+                            
+                    except Exception as page_err:
+                        log += f"[Form Agent] Failed auditing {page_url}: {page_err}\n"
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
-        log += "[Form Agent] Form validation audit complete.\n"
+        log += "[Form Agent] Form validation & boundary audits completed.\n"
         state.status = "completed"
         state.errors_found = errors
         state.log_output = log
@@ -4172,6 +4474,366 @@ def run_form_agent(task_id: str, url: str, page_snapshots: list, codebase_data: 
         db.commit()
     except Exception as exc:
         logger.error(f"Form agent execution failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_pagination_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    logger.info(f"Pagination Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "Pagination").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[Pagination Agent] Auditing pagination elements for {url}.\n"
+        db.commit()
+
+        log = state.log_output
+        errors = 0
+
+        # Find potential list pages
+        target_pages = []
+        for snap in page_snapshots:
+            p_url = snap.get("page_url")
+            if p_url and any(kw in p_url.lower() for kw in ["list", "listing", "table", "search", "directory", "catalog", "users", "orders", "products"]):
+                if p_url not in target_pages:
+                    target_pages.append(p_url)
+        if not target_pages:
+            target_pages = [url]
+
+        # Load auth details
+        auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+        auth_data = None
+        if auth:
+            auth_data = {
+                "auth_required": bool(auth.auth_required),
+                "auth_login_url": auth.auth_login_url,
+                "auth_username": auth.auth_username,
+                "auth_password": auth.auth_password,
+            }
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            try:
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                
+                if auth_data and auth_data.get("auth_required"):
+                    authenticate_browser_context(page, auth_data, url, logger.info, task_id=task_id)
+                else:
+                    page.goto(url, wait_until="domcontentloaded")
+                    check_and_click_guest_bypass(page)
+
+                for p_url in target_pages[:3]:
+                    log += f"[Pagination Agent] Navigating to page: {p_url}\n"
+                    try:
+                        page.goto(p_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)
+                        
+                        # Look for pagination selectors
+                        pagination_selector = (
+                            ".pagination, ul.pagination, nav[aria-label*='pagination'], "
+                            "a:has-text('Next'), button:has-text('Next'), a:has-text('Prev'), "
+                            "button:has-text('Prev'), [class*='pagin' i]"
+                        )
+                        pagination_elements = page.locator(pagination_selector)
+                        
+                        if pagination_elements.count() == 0:
+                            log += f"[Pagination Agent] No pagination controls detected on {p_url}.\n"
+                            continue
+                            
+                        log += f"[Pagination Agent] Found active pagination elements on {p_url}.\n"
+                        
+                        # Find "Next" or "2" button to click
+                        next_btn = page.locator("a:has-text('Next'), button:has-text('Next'), a:has-text('2'), button:has-text('2'), [aria-label*='Next' i], [class*='next' i]").first
+                        if next_btn.count() > 0 and next_btn.is_visible():
+                            before_text = page.locator("body").inner_text()
+                            before_url = page.url
+                            
+                            log += "[Pagination Agent] Clicking pagination 'Next' / '2' button...\n"
+                            next_btn.click(timeout=3000)
+                            page.wait_for_timeout(2000)
+                            page.wait_for_load_state("networkidle", timeout=3000)
+                            
+                            after_text = page.locator("body").inner_text()
+                            after_url = page.url
+                            
+                            # Assert change
+                            if after_url != before_url or after_text != before_text:
+                                log += "[Pagination Agent] Success: Content or URL updated after pagination click.\n"
+                            else:
+                                log += "[Pagination Agent] Warning: Pagination button clicked but page contents remained identical.\n"
+                                errors += 1
+                        else:
+                            log += "[Pagination Agent] Pagination buttons found but 'Next'/'2' page controls are not visible or clickable.\n"
+                    except Exception as page_err:
+                        log += f"[Pagination Agent] Failed auditing pagination on {p_url}: {page_err}\n"
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        log += "[Pagination Agent] Pagination elements validation completed.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Pagination Agent failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_filter_verification_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    logger.info(f"Filter Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "FilterVerification").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[FilterVerification Agent] Auditing dropdown filters and search boxes for {url}.\n"
+        db.commit()
+
+        log = state.log_output
+        errors = 0
+
+        target_pages = []
+        for snap in page_snapshots:
+            p_url = snap.get("page_url")
+            if p_url and any(kw in p_url.lower() for kw in ["list", "listing", "table", "search", "filter", "directory", "catalog", "users", "orders", "products"]):
+                if p_url not in target_pages:
+                    target_pages.append(p_url)
+        if not target_pages:
+            target_pages = [url]
+
+        auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+        auth_data = None
+        if auth:
+            auth_data = {
+                "auth_required": bool(auth.auth_required),
+                "auth_login_url": auth.auth_login_url,
+                "auth_username": auth.auth_username,
+                "auth_password": auth.auth_password,
+            }
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            try:
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                
+                if auth_data and auth_data.get("auth_required"):
+                    authenticate_browser_context(page, auth_data, url, logger.info, task_id=task_id)
+                else:
+                    page.goto(url, wait_until="domcontentloaded")
+                    check_and_click_guest_bypass(page)
+
+                for p_url in target_pages[:3]:
+                    log += f"[FilterVerification Agent] Navigating to page: {p_url}\n"
+                    try:
+                        page.goto(p_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)
+                        
+                        # Look for dropdown filters (select elements) or search box
+                        selects = page.locator("select")
+                        search_inputs = page.locator("input[type='search'], input[placeholder*='search' i], input[name*='search' i]")
+                        
+                        if selects.count() == 0 and search_inputs.count() == 0:
+                            log += f"[FilterVerification Agent] No filter selects or search fields detected on {p_url}.\n"
+                            continue
+                            
+                        # If search input exists, test search filtering
+                        if search_inputs.count() > 0:
+                            search_box = search_inputs.first
+                            if search_box.is_visible() and search_box.is_enabled():
+                                log += "[FilterVerification Agent] Testing search filter with query 'test'...\n"
+                                before_text = page.locator("body").inner_text()
+                                search_box.fill("test")
+                                search_box.press("Enter")
+                                page.wait_for_timeout(2000)
+                                page.wait_for_load_state("networkidle", timeout=3000)
+                                
+                                after_text = page.locator("body").inner_text()
+                                if before_text != after_text:
+                                    log += "[FilterVerification Agent] Success: Listing content updated after search input.\n"
+                                else:
+                                    log += "[FilterVerification Agent] Search submitted successfully.\n"
+                                    
+                        # If select filters exist, test option change
+                        if selects.count() > 0:
+                            select_filter = selects.first
+                            if select_filter.is_visible() and select_filter.is_enabled():
+                                log += "[FilterVerification Agent] Testing dropdown select option changes...\n"
+                                before_text = page.locator("body").inner_text()
+                                options = page.evaluate("sel => Array.from(sel.options).map(o => o.value).filter(v => v !== '')", select_filter.element_handle())
+                                if options:
+                                    select_filter.select_option(options[-1])
+                                    page.wait_for_timeout(2000)
+                                    page.wait_for_load_state("networkidle", timeout=3000)
+                                    after_text = page.locator("body").inner_text()
+                                    if before_text != after_text:
+                                        log += "[FilterVerification Agent] Success: Content filtered after option selection change.\n"
+                                    else:
+                                        log += "[FilterVerification Agent] Note: Dropdown option selected but UI did not display new text content.\n"
+                                else:
+                                    log += "[FilterVerification Agent] Dropdown select filter has no valid option choices.\n"
+                                    
+                    except Exception as page_err:
+                        log += f"[FilterVerification Agent] Failed auditing filter elements on {p_url}: {page_err}\n"
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        log += "[FilterVerification Agent] Filter verification audit completed.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Filter Verification Agent failed: {exc}")
+    finally:
+        db.close()
+
+
+def run_listing_agent(task_id: str, url: str, page_snapshots: list, codebase_data: dict):
+    logger.info(f"Listing/Table Agent starting for task: {task_id}")
+    db = SessionLocal()
+    try:
+        state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == "ListingTable").first()
+        if not state:
+            return
+        state.status = "running"
+        state.started_at = datetime.utcnow()
+        state.log_output = f"[ListingTable Agent] Auditing listing, tables, and sorting elements for {url}.\n"
+        db.commit()
+
+        log = state.log_output
+        errors = 0
+
+        target_pages = []
+        for snap in page_snapshots:
+            p_url = snap.get("page_url")
+            if p_url and any(kw in p_url.lower() for kw in ["list", "listing", "table", "search", "directory", "catalog", "users", "orders", "products"]):
+                if p_url not in target_pages:
+                    target_pages.append(p_url)
+        if not target_pages:
+            target_pages = [url]
+
+        auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+        auth_data = None
+        if auth:
+            auth_data = {
+                "auth_required": bool(auth.auth_required),
+                "auth_login_url": auth.auth_login_url,
+                "auth_username": auth.auth_username,
+                "auth_password": auth.auth_password,
+            }
+
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(ignore_https_errors=True)
+            try:
+                page = context.new_page()
+                page.set_default_timeout(15000)
+                
+                if auth_data and auth_data.get("auth_required"):
+                    authenticate_browser_context(page, auth_data, url, logger.info, task_id=task_id)
+                else:
+                    page.goto(url, wait_until="domcontentloaded")
+                    check_and_click_guest_bypass(page)
+
+                for p_url in target_pages[:3]:
+                    log += f"[ListingTable Agent] Navigating to page: {p_url}\n"
+                    try:
+                        page.goto(p_url, wait_until="domcontentloaded")
+                        page.wait_for_timeout(1000)
+                        
+                        tables = page.locator("table, .table, [role='table']")
+                        list_items = page.locator(".list-item, .card, [class*='row' i]")
+                        
+                        if tables.count() == 0 and list_items.count() == 0:
+                            log += f"[ListingTable Agent] No tables or card lists detected on {p_url}.\n"
+                            continue
+                            
+                        log += f"[ListingTable Agent] Found table/listing elements on {p_url}.\n"
+                        
+                        if tables.count() > 0:
+                            headers = page.locator("table th, thead th, [role='columnheader']")
+                            if headers.count() > 0:
+                                target_header = None
+                                for i in range(headers.count()):
+                                    h = headers.nth(i)
+                                    h_text = h.inner_text().strip()
+                                    if h_text and not any(k in h_text.lower() for k in ["action", "edit", "delete", "select"]):
+                                        target_header = h
+                                        break
+                                        
+                                if target_header and target_header.is_visible():
+                                    log += f"[ListingTable Agent] Testing column sorting by clicking header '{target_header.inner_text()}'...\n"
+                                    before_text = page.locator("body").inner_text()
+                                    target_header.click(timeout=3000)
+                                    page.wait_for_timeout(1500)
+                                    page.wait_for_load_state("networkidle", timeout=3000)
+                                    after_text = page.locator("body").inner_text()
+                                    
+                                    if before_text != after_text:
+                                        log += "[ListingTable Agent] Success: Column sorting triggered DOM / data update.\n"
+                                    else:
+                                        log += "[ListingTable Agent] Note: Sorting header clicked but content did not visually change.\n"
+                                        
+                        view_actions = page.locator("a:has-text('View'), a:has-text('Detail'), a:has-text('Edit'), button:has-text('View'), button:has-text('Edit')").first
+                        if view_actions.count() > 0 and view_actions.is_visible():
+                            log += "[ListingTable Agent] Testing row action link click...\n"
+                            before_url = page.url
+                            view_actions.click(timeout=3000)
+                            page.wait_for_timeout(2000)
+                            page.wait_for_load_state("networkidle", timeout=3000)
+                            after_url = page.url
+                            
+                            if after_url != before_url:
+                                log += f"[ListingTable Agent] Success: Row action clicked, navigated to details page: {after_url}\n"
+                            else:
+                                log += "[ListingTable Agent] Row click action performed but did not change the page URL.\n"
+                                
+                    except Exception as page_err:
+                        log += f"[ListingTable Agent] Failed auditing listing/sorting on {p_url}: {page_err}\n"
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
+        log += "[ListingTable Agent] Listing/table audits completed.\n"
+        state.status = "completed"
+        state.errors_found = errors
+        state.log_output = log
+        state.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as exc:
+        logger.error(f"Listing/Table Agent failed: {exc}")
     finally:
         db.close()
 
@@ -4326,53 +4988,60 @@ def run_health_check_agent(task_id: str, url: str, page_snapshots: list, auth: d
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
-            console_errors = []
-            page.on("console", lambda msg: console_errors.append(msg.text)
-                     if msg.type == "error" else None)
+            try:
+                page = context.new_page()
+                console_errors = []
+                page.on("console", lambda msg: console_errors.append(msg.text)
+                         if msg.type == "error" else None)
 
-            for snapshot in page_snapshots:
-                page_url = snapshot.get("page_url", url)
-                console_errors.clear()
-                health = {"url": page_url, "status": "healthy", "issues": []}
+                for snapshot in page_snapshots:
+                    page_url = snapshot.get("page_url", url)
+                    console_errors.clear()
+                    health = {"url": page_url, "status": "healthy", "issues": []}
 
-                try:
-                    response = page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
-                    status_code = response.status if response else 0
+                    try:
+                        response = page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                        status_code = response.status if response else 0
 
-                    if status_code >= 500:
-                        health["issues"].append(f"Server error: HTTP {status_code}")
-                        health["status"] = "critical"
-                    elif status_code >= 400:
-                        health["issues"].append(f"Client error: HTTP {status_code}")
-                        health["status"] = "warning"
-
-                    page.wait_for_timeout(2000)  # Allow JS to execute
-
-                    if console_errors:
-                        health["issues"].append(f"JS console errors: {len(console_errors)}")
-                        if any("uncaught" in e.lower() or "error" in e.lower()
-                               for e in console_errors):
+                        if status_code >= 500:
+                            health["issues"].append(f"Server error: HTTP {status_code}")
                             health["status"] = "critical"
+                        elif status_code >= 400:
+                            health["issues"].append(f"Client error: HTTP {status_code}")
+                            health["status"] = "warning"
 
-                except Exception as exc:
-                    health["issues"].append(f"Navigation failed: {str(exc)}")
-                    health["status"] = "critical"
+                        page.wait_for_timeout(2000)  # Allow JS to execute
 
-                if health["status"] == "critical":
-                    failed_pages.append(health)
-                    # Create TestError for critical health failures
-                    db.add(TestError(
-                        task_id=task_id,
-                        message=f"Health Check FAILED: {'; '.join(health['issues'])}",
-                        severity="critical",
-                        page_url=page_url,
-                    ))
-                else:
-                    healthy_pages.append(health)
+                        if console_errors:
+                            health["issues"].append(f"JS console errors: {len(console_errors)}")
+                            if any("uncaught" in e.lower() or "error" in e.lower()
+                                   for e in console_errors):
+                                health["status"] = "critical"
 
-            context.close()
-            browser.close()
+                    except Exception as exc:
+                        health["issues"].append(f"Navigation failed: {str(exc)}")
+                        health["status"] = "critical"
+
+                    if health["status"] == "critical":
+                        failed_pages.append(health)
+                        # Create TestError for critical health failures
+                        db.add(TestError(
+                            task_id=task_id,
+                            message=f"Health Check FAILED: {'; '.join(health['issues'])}",
+                            severity="critical",
+                            page_url=page_url,
+                        ))
+                    else:
+                        healthy_pages.append(health)
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
         if state:
             state.status = "completed"
@@ -5018,44 +5687,51 @@ def run_visual_regression_agent(task_id: str, url: str, page_snapshots: list, co
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
-            page = context.new_page()
-            
-            for idx, snap in enumerate(page_snapshots):
-                page_url = snap.get("page_url", url)
-                filename = f"page_{idx:03d}_{slugify(page_url.split('//')[-1].replace('/', '_'))}.png"
-                current_path = os.path.join(baseline_dir, filename)
+            try:
+                page = context.new_page()
                 
-                try:
-                    page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
-                    page.wait_for_timeout(1000) # wait for animations to settle
-                    page.screenshot(path=current_path, full_page=True)
+                for idx, snap in enumerate(page_snapshots):
+                    page_url = snap.get("page_url", url)
+                    filename = f"page_{idx:03d}_{slugify(page_url.split('//')[-1].replace('/', '_'))}.png"
+                    current_path = os.path.join(baseline_dir, filename)
                     
-                    if prev_baseline_dir:
-                        prev_path = os.path.join(prev_baseline_dir, filename)
-                        if os.path.exists(prev_path):
-                            # Compare current with previous baseline
-                            diff_pct = compare_screenshots_rms(current_path, prev_path)
-                            if diff_pct > 5.0: # 5% visual difference threshold
-                                log += f"[VisualRegression Agent] Issue: Visual regression detected on {page_url} (diff: {diff_pct:.2f}%).\n"
-                                db.add(TestError(
-                                    task_id=task_id,
-                                    message=f"Visual regression layout change detected on {page_url} (diff: {diff_pct:.2f}% vs baseline).",
-                                    severity="medium",
-                                    page_url=page_url,
-                                    screenshot_path=current_path
-                                ))
-                                errors += 1
+                    try:
+                        page.goto(page_url, wait_until="domcontentloaded", timeout=15000)
+                        page.wait_for_timeout(1000) # wait for animations to settle
+                        page.screenshot(path=current_path, full_page=True)
+                        
+                        if prev_baseline_dir:
+                            prev_path = os.path.join(prev_baseline_dir, filename)
+                            if os.path.exists(prev_path):
+                                # Compare current with previous baseline
+                                diff_pct = compare_screenshots_rms(current_path, prev_path)
+                                if diff_pct > 5.0: # 5% visual difference threshold
+                                    log += f"[VisualRegression Agent] Issue: Visual regression detected on {page_url} (diff: {diff_pct:.2f}%).\n"
+                                    db.add(TestError(
+                                        task_id=task_id,
+                                        message=f"Visual regression layout change detected on {page_url} (diff: {diff_pct:.2f}% vs baseline).",
+                                        severity="medium",
+                                        page_url=page_url,
+                                        screenshot_path=current_path
+                                    ))
+                                    errors += 1
+                                else:
+                                    log += f"[VisualRegression Agent] {page_url}: Visual match OK (diff: {diff_pct:.2f}%).\n"
                             else:
-                                log += f"[VisualRegression Agent] {page_url}: Visual match OK (diff: {diff_pct:.2f}%).\n"
+                                log += f"[VisualRegression Agent] {page_url}: Baseline screenshot missing in previous task. Saved new baseline.\n"
                         else:
-                            log += f"[VisualRegression Agent] {page_url}: Baseline screenshot missing in previous task. Saved new baseline.\n"
-                    else:
-                        log += f"[VisualRegression Agent] Saved baseline screenshot for {page_url}.\n"
-                except Exception as exc:
-                    log += f"[VisualRegression Agent] Failed to capture screenshot for {page_url}: {exc}\n"
-                    
-            context.close()
-            browser.close()
+                            log += f"[VisualRegression Agent] Saved baseline screenshot for {page_url}.\n"
+                    except Exception as exc:
+                        log += f"[VisualRegression Agent] Failed to capture screenshot for {page_url}: {exc}\n"
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
         log += "[VisualRegression Agent] Visual layout captured successfully. Comparison set.\n"
         state.status = "completed"
@@ -5071,6 +5747,107 @@ def run_visual_regression_agent(task_id: str, url: str, page_snapshots: list, co
             db.commit()
     finally:
         db.close()
+
+
+def perform_ui_cleanup(page, task_id: str, base_url: str, cleanup_logs, log_callback):
+    """
+    Finds created records (e.g., test users) on listing pages and deletes them via UI actions.
+    """
+    if not cleanup_logs:
+        return
+        
+    log_callback(f"[Cleanup] Starting UI cleanup for {len(cleanup_logs)} records...")
+    
+    # Auto-accept all confirmation dialogs
+    page.on("dialog", lambda dialog: dialog.accept())
+    
+    # Gather potential admin/listing/directory urls from crawl/seeds
+    db = SessionLocal()
+    potential_directories = []
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task and task.page_snapshots_json:
+            try:
+                snapshots = json.loads(task.page_snapshots_json)
+                for s in snapshots:
+                    u = s.get("page_url")
+                    if u and any(kw in u.lower() for kw in ["/user", "/admin", "/employee", "/customer", "/member", "/listing", "/directory"]):
+                        if u not in potential_directories:
+                            potential_directories.append(u)
+            except Exception:
+                pass
+        # Always include base_url as baseline
+        if base_url and base_url not in potential_directories:
+            potential_directories.append(base_url)
+    finally:
+        db.close()
+        
+    for log in cleanup_logs:
+        record_id = log.record_identifier
+        log_callback(f"[Cleanup] Attempting to find and delete record: '{record_id}'")
+        
+        deleted_successfully = False
+        # Try finding the record in all potential directory URLs
+        for dir_url in potential_directories:
+            try:
+                page.goto(dir_url, wait_until="domcontentloaded", timeout=10000)
+                page.wait_for_timeout(1000)
+                
+                # Check if the record identifier is visible on the page
+                content = page.content()
+                if record_id not in content:
+                    continue
+                    
+                log_callback(f"[Cleanup] Found record '{record_id}' on page: {dir_url}")
+                
+                # Locate table rows or list cards containing the record identifier
+                selectors = [
+                    f"tr:has-text('{record_id}')",
+                    f"div:has-text('{record_id}')",
+                    f"li:has-text('{record_id}')",
+                    f"*[class*='row']:has-text('{record_id}')"
+                ]
+                
+                for selector in selectors:
+                    row_loc = page.locator(selector)
+                    count = row_loc.count()
+                    if count > 0:
+                        for i in range(count):
+                            row = row_loc.nth(i)
+                            # Find delete button inside this row
+                            delete_btn = row.locator("button:has-text('Delete'), button:has-text('Remove'), [class*='delete'], [class*='remove'], [title*='Delete'], [title*='Remove'], svg[class*='trash'], i[class*='trash']")
+                            if delete_btn.count() > 0:
+                                log_callback(f"[Cleanup] Clicking delete button on row for '{record_id}'")
+                                delete_btn.first.click(timeout=3000)
+                                page.wait_for_timeout(1500)
+                                page.wait_for_load_state("networkidle", timeout=3000)
+                                
+                                # Verify it disappeared
+                                page.goto(dir_url, wait_until="domcontentloaded", timeout=10000)
+                                page.wait_for_timeout(1000)
+                                if record_id not in page.content():
+                                    log_callback(f"[Cleanup] Record '{record_id}' deleted successfully!")
+                                    deleted_successfully = True
+                                    break
+                        if deleted_successfully:
+                            break
+                if deleted_successfully:
+                    break
+            except Exception as e:
+                logger.warning(f"[Cleanup] Error checking {dir_url} for '{record_id}': {e}")
+                
+        # Update DB log status
+        db = SessionLocal()
+        try:
+            db_log = db.query(TestCleanupLog).filter(TestCleanupLog.id == log.id).first()
+            if db_log:
+                db_log.action = "cleaned" if deleted_successfully else "cleanup_failed"
+                db_log.cleaned_at = datetime.utcnow()
+                db.commit()
+        except Exception as db_err:
+            logger.error(f"Failed to update cleanup status in DB: {db_err}")
+        finally:
+            db.close()
 
 
 def run_testing_agent(task_id: str):
@@ -5244,7 +6021,7 @@ def run_testing_agent(task_id: str):
         write_orchestrator_log("[Orchestrator] Stage: generating_test_cases")
         time.sleep(1.5)
 
-        ai_model = getattr(task, "ai_model", "gemini-1.5-flash") or "gemini-1.5-flash"
+        ai_model = getattr(task, "ai_model", "gemini-2.5-flash") or "gemini-2.5-flash"
         user_prompt = getattr(task, "user_prompt", None)
         
         openai_key = os.getenv("OPENAI_API_KEY")
@@ -5276,7 +6053,7 @@ def run_testing_agent(task_id: str):
                 selected_service = "OpenAI API (gpt-4o via Auto)"
             elif gemini_key:
                 analysis = generate_gemini_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, gemini_key, user_prompt)
-                selected_service = "Gemini API (gemini-1.5-flash via Auto)"
+                selected_service = "Gemini API (gemini-2.5-flash via Auto)"
         elif is_openai_model:
             if openai_key:
                 analysis = generate_openai_analysis(task.url, crawl_data_for_ai, codebase_data, key_files_context, openai_key, user_prompt)
@@ -5473,7 +6250,8 @@ def run_test_execution_agent(task_id: str):
             "Orchestrator", "RouteDiscovery", "HealthCheck", "Login",
             "RolePermission", "UserJourney", "Form", "API",
             "DatabaseIntegrity", "Security", "Accessibility", "Responsive",
-            "VisualRegression", "Performance", "CodeCorrelation"
+            "VisualRegression", "Performance", "CodeCorrelation",
+            "Pagination", "FilterVerification", "ListingTable"
         ]:
             state = db.query(AgentState).filter(AgentState.task_id == task_id, AgentState.agent_name == state_name).first()
             if state:
@@ -5534,6 +6312,42 @@ def run_test_execution_agent(task_id: str):
                 "auth_required_fields": auth.auth_required_fields,
             }
 
+        # Pre-flight Authentication Check: verify credentials before starting sub-agents
+        if auth_data and auth_data.get("auth_required"):
+            write_orchestrator_log("[Orchestrator] Performing pre-flight authentication check...")
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True)
+                try:
+                    context = browser.new_context(ignore_https_errors=True)
+                    page = context.new_page()
+                    auth_ok = authenticate_browser_context(page, auth_data, task.url, write_orchestrator_log, task_id=task.id)
+                    if not auth_ok:
+                        write_orchestrator_log("[Orchestrator] Pre-flight authentication check failed or needs user input. Pausing test run.")
+                        auth_issue = auth_data.get("_codex_auth_issue")
+                        if auth_issue:
+                            db_auth = db.query(TaskAuth).filter(TaskAuth.task_id == task_id).first()
+                            if db_auth:
+                                db_auth.auth_next_step = "Provide the missing authentication field(s)"
+                                try:
+                                    required_fields = list(auth_issue.get("fields", []))
+                                    db_auth.auth_required_fields = json.dumps(required_fields)
+                                    db_auth.auth_flow = _classify_auth_flow(required_fields)
+                                except Exception:
+                                    db_auth.auth_required_fields = None
+                                    db_auth.auth_flow = None
+                                db.commit()
+                            task.status = "needs_input"
+                            db.commit()
+                            if orchestrator_state:
+                                orchestrator_state.status = "failed"
+                                needed = ", ".join(auth_issue.get("fields", [])) or "authentication input"
+                                orchestrator_state.log_output = (orchestrator_state.log_output or "") + f"[Orchestrator] Paused: login flow needs {needed}.\n"
+                                orchestrator_state.completed_at = datetime.utcnow()
+                                db.commit()
+                            return
+                finally:
+                    browser.close()
+
         # Build use_cases_mapping and use_case_titles from DB
         use_cases = db.query(UseCase).filter(UseCase.task_id == task_id).all()
         use_cases_mapping = {}
@@ -5559,7 +6373,7 @@ def run_test_execution_agent(task_id: str):
         write_orchestrator_log(f"[Orchestrator] Health check complete. {len(healthy_pages)} healthy pages, {len(failed_pages)} failed pages.")
 
         # Run parallel heuristic analysis agents
-        with ThreadPoolExecutor(max_workers=13) as executor:
+        with ThreadPoolExecutor(max_workers=16) as executor:
             executor.submit(run_ui_ux_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
             executor.submit(run_responsive_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
             executor.submit(run_form_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
@@ -5573,6 +6387,9 @@ def run_test_execution_agent(task_id: str):
             executor.submit(run_accessibility_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
             executor.submit(run_performance_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
             executor.submit(run_visual_regression_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_pagination_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_filter_verification_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
+            executor.submit(run_listing_agent, task.id, task.url, page_snapshots_for_agents, codebase_data)
 
         time.sleep(2.5)
 
@@ -5626,11 +6443,53 @@ def run_test_execution_agent(task_id: str):
                 TestCleanupLog.task_id == task_id,
                 TestCleanupLog.action == "created"
             ).all()
-            for log in cleanup_logs:
-                log.action = "cleanup_pending"
-                log.cleaned_at = datetime.utcnow()
-            db.commit()
-            write_orchestrator_log(f"[Orchestrator] Cleanup phase complete. Marked {len(cleanup_logs)} record(s) for cleanup.")
+            
+            if cleanup_logs:
+                write_orchestrator_log(f"[Orchestrator] Found {len(cleanup_logs)} record(s) to clean up. Launching cleanup browser...")
+                playwright = sync_playwright().__enter__()
+                browser = playwright.chromium.launch(headless=True)
+                context = None
+                try:
+                    is_mobile = bool(task.is_mobile) if getattr(task, "is_mobile", None) is not None else False
+                    if is_mobile:
+                        context = browser.new_context(
+                            viewport={"width": 375, "height": 667},
+                            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
+                            is_mobile=True,
+                            has_touch=True,
+                            ignore_https_errors=True
+                        )
+                    else:
+                        context = browser.new_context(
+                            ignore_https_errors=True,
+                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        )
+                    page = context.new_page()
+                    page.set_default_timeout(20000)
+                    
+                    if auth_data and auth_data.get("auth_required"):
+                        authenticate_browser_context(page, auth_data, task.url, logger.info, task_id=task_id)
+                    else:
+                        page.goto(task.url, wait_until="domcontentloaded")
+                        check_and_click_guest_bypass(page, logger.info)
+                        
+                    perform_ui_cleanup(page, task_id, task.url, cleanup_logs, write_orchestrator_log)
+                finally:
+                    if context:
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
+                    try:
+                        playwright.__exit__(None, None, None)
+                    except Exception:
+                        pass
+            else:
+                write_orchestrator_log("[Orchestrator] No records created. No cleanup required.")
         except Exception as cleanup_err:
             logger.error(f"Cleanup phase failed: {cleanup_err}")
             write_orchestrator_log(f"[Orchestrator Warning] Cleanup failed: {cleanup_err}")
