@@ -22,7 +22,14 @@ def normalize_url(url: str) -> str:
     if not url:
         return url
     if not url.startswith("http://") and not url.startswith("https://"):
-        return "https://" + url
+        url = "https://" + url
+    # Strip URL fragments (#hash) — they don't change the server-side page
+    if "#" in url:
+        url = url.split("#")[0]
+    # Remove trailing slash for consistent deduplication
+    url = url.rstrip("/")
+    # Normalize www vs non-www (prefer without www)
+    url = url.replace("://www.", "://")
     return url
 
 
@@ -923,8 +930,10 @@ def discover_pages_with_playwright(url: str, max_pages: int = 1000, auth: dict =
                     normal_priority_candidates = []
                     for href in link_hrefs + clicked_hrefs:
                         candidate_href = href.get("href") if isinstance(href, dict) else href
+                        # Normalize candidate URL to strip fragments and www
+                        candidate_href = normalize_url(candidate_href) if candidate_href else None
                         if candidate_href and same_site(candidate_href, normalized) and candidate_href.rstrip("/") not in visited and candidate_href not in queue:
-                            is_dynamic = any(d in candidate_href.lower() for d in ["/edit", "/delete", "/update", "/show", "/view", "/detail", "?", "#"])
+                            is_dynamic = any(d in candidate_href.lower() for d in ["/edit", "/delete", "/update", "/show", "/view", "/detail", "?"])
                             is_auth_kw = any(nb in candidate_href.lower() for nb in ["logout", "signout", "login", "signin"])
                             is_admin_dashboard = any(p in candidate_href.lower() for p in ["/admin", "/dashboard", "/app", "/portal"])
                             
@@ -1174,8 +1183,14 @@ def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
         })
 
     # Build a page-by-page view so every discovered screen gets its own targeted checks.
+    seen_page_urls = set()
     for page in pages or []:
         page_profile = build_page_profile(page, page_url)
+        # Deduplicate: skip pages whose normalized URL was already processed
+        normalized_page_url = normalize_url(page_profile.get("page_url", ""))
+        if normalized_page_url in seen_page_urls:
+            continue
+        seen_page_urls.add(normalized_page_url)
         page_title = page_profile["title"]
         page_specific_cases = [
             pending_test(
@@ -1273,8 +1288,13 @@ def build_test_plan(url: str, pages: list, codebase_data: dict) -> dict:
     codebase_path = codebase_data.get("codebase_path")
     if codebase_path and os.path.isdir(codebase_path):
         codebase_page_info = extract_codebase_page_info(codebase_path, codebase_data)
+        seen_codebase_urls = set()
         for page in pages or []:
             page_profile = build_page_profile(page, page_url)
+            normalized_cb_url = normalize_url(page_profile.get("page_url", ""))
+            if normalized_cb_url in seen_codebase_urls:
+                continue
+            seen_codebase_urls.add(normalized_cb_url)
             comp_name = match_url_to_component(page_profile["page_url"], codebase_page_info)
             if comp_name:
                 info = codebase_page_info[comp_name]
@@ -3364,172 +3384,257 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
     video_dir = os.path.join("videos", task_id)
     os.makedirs(video_dir, exist_ok=True)
 
+    # ── Group test cases by normalized page_url ──────────────────────────
+    from collections import defaultdict, OrderedDict
+    tests_by_page = OrderedDict()   # page_url -> [(use_case_id, test_data), ...]
+    for use_case_id, test_cases in use_case_mapping.items():
+        for test_data in test_cases:
+            is_existing_model = not isinstance(test_data, dict)
+            if is_existing_model:
+                raw_url = test_data.page_url or base_url
+            else:
+                raw_url = test_data.get("page_url", base_url)
+            page_url = normalize_url(raw_url)
+            if page_url not in tests_by_page:
+                tests_by_page[page_url] = []
+            tests_by_page[page_url].append((use_case_id, test_data))
+
+    if log_callback:
+        log_callback(f"[Orchestrator] Grouped tests into {len(tests_by_page)} unique page(s).")
+
+    # ── Execution-level dedup: track (normalized_url, check_type) ────────
+    tested_checks = set()
+
     playwright = sync_playwright().__enter__()
     browser = playwright.chromium.launch(headless=True)
-    context = None
     try:
-        if is_mobile:
-            context = browser.new_context(
-                viewport={"width": 375, "height": 667},
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
-                is_mobile=True,
-                has_touch=True,
-                ignore_https_errors=True,
-                record_video_dir=video_dir,
-                record_video_size={"width": 1280, "height": 720}
-            )
-        else:
-            context = browser.new_context(
-                ignore_https_errors=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                record_video_dir=video_dir,
-                record_video_size={"width": 1280, "height": 720}
-            )
-        page = context.new_page()
-        page.set_default_timeout(20000)
-        if auth and auth.get("auth_required"):
-            auth_ok = authenticate_browser_context(page, auth, base_url or normalize_url(pages[0].get("page_url")) if pages else "", logger.info, task_id=task_id)
-            if not auth_ok:
-                if log_callback:
-                    log_callback("[Orchestrator] Pre-flight authentication check failed or requires input. Pausing test execution.")
-                return error_ids
-
-        # Check for guest bypass option if no auth is required
-        if not (auth and auth.get("auth_required")) and base_url:
+        # ── Iterate per unique page, creating a fresh context+video per page ─
+        for page_url, tests_for_page in tests_by_page.items():
+            # Check cancellation before starting a new page context
             try:
-                if log_callback:
-                    log_callback(f"[GuestBypass] Initializing guest bypass session by visiting {base_url}")
-                page.goto(base_url, wait_until="domcontentloaded")
-                try:
-                    page.wait_for_load_state("networkidle", timeout=5000)
-                except Exception:
-                    pass
-                check_and_click_guest_bypass(page, log_callback)
-                save_live_screenshot(page, task_id)
-            except Exception as e:
-                if log_callback:
-                    log_callback(f"[GuestBypass] Warning: Failed guest bypass initialization: {e}")
+                db_check = SessionLocal()
+                task_status = db_check.query(Task.status).filter(Task.id == task_id).scalar()
+                db_check.close()
+                if task_status == "stopped":
+                    if log_callback:
+                        log_callback("[Orchestrator] Test execution cancelled by the user. Stopping validation loop.")
+                    break
+            except Exception:
+                pass
 
-        for use_case_id, test_cases in use_case_mapping.items():
-            for test_data in test_cases:
-                # Check cancellation status
-                try:
-                    db_check = SessionLocal()
-                    task_status = db_check.query(Task.status).filter(Task.id == task_id).scalar()
-                    db_check.close()
-                    if task_status == "stopped":
-                        if log_callback:
-                            log_callback("[Orchestrator] Test execution cancelled by the user. Stopping validation loop.")
-                        return error_ids
-                except Exception:
-                    pass
-
-                is_existing_model = not isinstance(test_data, dict)
-                if is_existing_model:
-                    tc_id = test_data.id
-                    tc_title = test_data.title
-                    tc_steps = test_data.steps
-                    tc_expected = test_data.expected_result
-                    page_url = normalize_url(test_data.page_url or base_url)
-                    test_data_dict = {
-                        "title": tc_title,
-                        "steps": tc_steps,
-                        "expected_result": tc_expected,
-                        "page_url": page_url,
-                        "severity": "medium",
-                        "check_type": "custom_scenario",
-                        "task_id": task_id
-                    }
+            # Create a new browser context with video recording for this page
+            page_error_ids = []
+            context = None
+            try:
+                if is_mobile:
+                    context = browser.new_context(
+                        viewport={"width": 375, "height": 667},
+                        user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 14_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Mobile/15E148 Safari/604.1",
+                        is_mobile=True,
+                        has_touch=True,
+                        ignore_https_errors=True,
+                        record_video_dir=video_dir,
+                        record_video_size={"width": 1280, "height": 720}
+                    )
                 else:
-                    tc_id = None
-                    tc_title = test_data.get("title", "Anonymous Test")
-                    tc_steps = test_data.get("steps")
-                    tc_expected = test_data.get("expected_result")
-                    page_url = normalize_url(test_data.get("page_url", base_url))
-                    test_data_dict = {**test_data, "task_id": task_id}
+                    context = browser.new_context(
+                        ignore_https_errors=True,
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        record_video_dir=video_dir,
+                        record_video_size={"width": 1280, "height": 720}
+                    )
+                page = context.new_page()
+                page.set_default_timeout(20000)
 
-                test_profile = page_profiles.get(page_url, profile)
+                # Authenticate once for this context
+                if auth and auth.get("auth_required"):
+                    auth_ok = authenticate_browser_context(page, auth, base_url or (normalize_url(pages[0].get("page_url")) if pages else ""), logger.info, task_id=task_id)
+                    if not auth_ok:
+                        if log_callback:
+                            log_callback("[Orchestrator] Pre-flight authentication check failed or requires input. Pausing test execution.")
+                        return error_ids
+
+                # Guest bypass for non-auth sessions
+                if not (auth and auth.get("auth_required")) and base_url:
+                    try:
+                        page.goto(base_url, wait_until="domcontentloaded")
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=5000)
+                        except Exception:
+                            pass
+                        check_and_click_guest_bypass(page, log_callback)
+                        save_live_screenshot(page, task_id)
+                    except Exception as e:
+                        if log_callback:
+                            log_callback(f"[GuestBypass] Warning: Failed guest bypass initialization: {e}")
+
                 if log_callback:
-                    log_callback(f"[Orchestrator] Testing page: {page_url} :: {tc_title}")
+                    log_callback(f"[Orchestrator] Running {len(tests_for_page)} test(s) for page: {page_url}")
 
-                # Update status of existing test case to "running" in the DB before executing
-                if is_existing_model:
+                # Run all tests for this page URL
+                for use_case_id, test_data in tests_for_page:
+                    # Check cancellation mid-page
+                    try:
+                        db_check = SessionLocal()
+                        task_status = db_check.query(Task.status).filter(Task.id == task_id).scalar()
+                        db_check.close()
+                        if task_status == "stopped":
+                            if log_callback:
+                                log_callback("[Orchestrator] Test execution cancelled by the user. Stopping validation loop.")
+                            break
+                    except Exception:
+                        pass
+
+                    is_existing_model = not isinstance(test_data, dict)
+                    if is_existing_model:
+                        tc_id = test_data.id
+                        tc_title = test_data.title
+                        tc_steps = test_data.steps
+                        tc_expected = test_data.expected_result
+                        tc_page_url = normalize_url(test_data.page_url or base_url)
+                        test_data_dict = {
+                            "title": tc_title,
+                            "steps": tc_steps,
+                            "expected_result": tc_expected,
+                            "page_url": tc_page_url,
+                            "severity": "medium",
+                            "check_type": "custom_scenario",
+                            "task_id": task_id
+                        }
+                    else:
+                        tc_id = None
+                        tc_title = test_data.get("title", "Anonymous Test")
+                        tc_steps = test_data.get("steps")
+                        tc_expected = test_data.get("expected_result")
+                        tc_page_url = normalize_url(test_data.get("page_url", base_url))
+                        test_data_dict = {**test_data, "task_id": task_id}
+
+                    # ── Execution dedup: skip duplicate (url, check_type) pairs ──
+                    check_type = test_data_dict.get("check_type", "")
+                    check_key = (tc_page_url, check_type, tc_title)
+                    if check_key in tested_checks:
+                        if log_callback:
+                            log_callback(f"[Orchestrator] Skipped duplicate: {tc_title} on {tc_page_url}")
+                        # Mark existing DB test case as skipped
+                        if is_existing_model:
+                            db = SessionLocal()
+                            try:
+                                db_tc = db.query(TestCase).filter(TestCase.id == tc_id).first()
+                                if db_tc:
+                                    db_tc.status = "passed"
+                                    db_tc.error_message = "Skipped: duplicate test already executed for this page."
+                                    db_tc.execution_time = 0.0
+                                    db.commit()
+                            finally:
+                                db.close()
+                        continue
+                    tested_checks.add(check_key)
+
+                    test_profile = page_profiles.get(tc_page_url, profile)
+                    if log_callback:
+                        log_callback(f"[Orchestrator] Testing page: {tc_page_url} :: {tc_title}")
+
+                    # Update status of existing test case to "running" in the DB before executing
+                    if is_existing_model:
+                        db = SessionLocal()
+                        try:
+                            db_tc = db.query(TestCase).filter(TestCase.id == tc_id).first()
+                            if db_tc:
+                                db_tc.status = "running"
+                                db.commit()
+                        finally:
+                            db.close()
+
+                    actual_status, actual_error, severity_val = run_test_validation(page, context, test_data_dict, test_profile, auth)
+                    if log_callback:
+                        outcome = "passed" if actual_status == "passed" else "failed"
+                        log_callback(f"[Orchestrator] Result: {outcome} for {tc_page_url}")
+
                     db = SessionLocal()
                     try:
-                        db_tc = db.query(TestCase).filter(TestCase.id == tc_id).first()
-                        if db_tc:
-                            db_tc.status = "running"
+                        test_case = None
+                        if is_existing_model:
+                            test_case = db.query(TestCase).filter(TestCase.id == tc_id).first()
+                            if test_case:
+                                test_case.status = actual_status
+                                test_case.error_message = actual_error
+                                test_case.steps = test_data_dict.get("steps", test_case.steps)
+                                test_case.expected_result = test_data_dict.get("expected_result", test_case.expected_result)
+                                test_case.execution_time = round(0.5 + float(time.time() % 1), 2)
+                                db.commit()
+                                db.refresh(test_case)
+                        else:
+                            test_case = TestCase(
+                                task_id=task_id,
+                                use_case_id=use_case_id,
+                                title=tc_title,
+                                steps=tc_steps,
+                                expected_result=tc_expected,
+                                status=actual_status,
+                                error_message=actual_error,
+                                execution_time=round(0.5 + float(time.time() % 1), 2),
+                                test_type=test_data_dict.get("test_type"),
+                                page_url=tc_page_url
+                            )
+                            db.add(test_case)
                             db.commit()
+                            db.refresh(test_case)
+
+                        if test_case:
+                            screenshot_name = f"{slugify(use_case_titles.get(use_case_id, 'use_case'))}_{slugify(tc_title)}.png"
+                            screenshot_path = os.path.join(screenshot_dir, screenshot_name)
+                            save_screenshot(page, screenshot_path)
+                            test_error = TestError(
+                                task_id=task_id,
+                                test_case_id=test_case.id,
+                                message=actual_error or ("Validation passed successfully." if actual_status == "passed" else "Validation failed during execution."),
+                                severity="passed" if actual_status == "passed" else (severity_val or (test_data.get("severity") if isinstance(test_data, dict) else "medium") or "medium"),
+                                page_url=tc_page_url,
+                                screenshot_path=screenshot_path
+                            )
+                            db.add(test_error)
+                            db.commit()
+                            db.refresh(test_error)
+                            page_error_ids.append(test_error.id)
+                            error_ids.append(test_error.id)
                     finally:
                         db.close()
 
-                actual_status, actual_error, severity_val = run_test_validation(page, context, test_data_dict, test_profile, auth)
-                if log_callback:
-                    outcome = "passed" if actual_status == "passed" else "failed"
-                    log_callback(f"[Orchestrator] Result: {outcome} for {page_url}")
-
-                db = SessionLocal()
+                # Capture per-page video path before closing context
+                raw_video_path = None
                 try:
-                    test_case = None
-                    if is_existing_model:
-                        test_case = db.query(TestCase).filter(TestCase.id == tc_id).first()
-                        if test_case:
-                            test_case.status = actual_status
-                            test_case.error_message = actual_error
-                            test_case.steps = test_data_dict.get("steps", test_case.steps)
-                            test_case.expected_result = test_data_dict.get("expected_result", test_case.expected_result)
-                            test_case.execution_time = round(0.5 + float(time.time() % 1), 2)
-                            db.commit()
-                            db.refresh(test_case)
-                    else:
-                        test_case = TestCase(
-                            task_id=task_id,
-                            use_case_id=use_case_id,
-                            title=tc_title,
-                            steps=tc_steps,
-                            expected_result=tc_expected,
-                            status=actual_status,
-                            error_message=actual_error,
-                            execution_time=round(0.5 + float(time.time() % 1), 2),
-                            test_type=test_data_dict.get("test_type"),
-                            page_url=page_url
-                        )
-                        db.add(test_case)
-                        db.commit()
-                        db.refresh(test_case)
+                    if page and page.video:
+                        raw_video_path = page.video.path()
+                except Exception as e:
+                    logger.warning(f"Could not retrieve video path for {page_url}: {e}")
 
-                    if test_case:
-                        screenshot_name = f"{slugify(use_case_titles.get(use_case_id, 'use_case'))}_{slugify(tc_title)}.png"
-                        screenshot_path = os.path.join(screenshot_dir, screenshot_name)
-                        save_screenshot(page, screenshot_path)
-                        test_error = TestError(
-                            task_id=task_id,
-                            test_case_id=test_case.id,
-                            message=actual_error or ("Validation passed successfully." if actual_status == "passed" else "Validation failed during execution."),
-                            severity="passed" if actual_status == "passed" else (severity_val or (test_data.get("severity") if isinstance(test_data, dict) else "medium") or "medium"),
-                            page_url=page_url,
-                            screenshot_path=screenshot_path
-                        )
-                        db.add(test_error)
-                        db.commit()
-                        db.refresh(test_error)
-                        error_ids.append(test_error.id)
-                finally:
-                    db.close()
+            finally:
+                if context:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
 
-        raw_video_path = None
-        try:
-            if page and page.video:
-                raw_video_path = page.video.path()
-        except Exception as e:
-            logger.warning(f"Could not retrieve video path: {e}")
+                # Map video path to all test errors for this page
+                if raw_video_path:
+                    time.sleep(0.3)
+                    if os.path.exists(raw_video_path):
+                        filename = os.path.basename(raw_video_path)
+                        video_relative_path = os.path.join("videos", task_id, filename)
+                        db = SessionLocal()
+                        try:
+                            if page_error_ids:
+                                db.query(TestError).filter(TestError.id.in_(page_error_ids)).update(
+                                    {TestError.video_path: video_relative_path},
+                                    synchronize_session=False
+                                )
+                                db.commit()
+                        except Exception as db_err:
+                            logger.error(f"Failed to update video_path in DB: {db_err}")
+                        finally:
+                            db.close()
 
     finally:
-        if context:
-            try:
-                context.close()
-            except Exception:
-                pass
         try:
             browser.close()
         except Exception:
@@ -3538,24 +3643,6 @@ def execute_test_plan(task_id: str, pages: list, use_case_mapping: dict, use_cas
             playwright.__exit__(None, None, None)
         except Exception:
             pass
-
-        if raw_video_path:
-            time.sleep(0.5)
-            if os.path.exists(raw_video_path):
-                filename = os.path.basename(raw_video_path)
-                video_relative_path = os.path.join("videos", task_id, filename)
-                db = SessionLocal()
-                try:
-                    if error_ids:
-                        db.query(TestError).filter(TestError.id.in_(error_ids)).update(
-                            {TestError.video_path: video_relative_path},
-                            synchronize_session=False
-                        )
-                        db.commit()
-                except Exception as db_err:
-                    logger.error(f"Failed to update video_path in DB: {db_err}")
-                finally:
-                    db.close()
 
     return error_ids
 

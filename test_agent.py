@@ -152,5 +152,63 @@ class CodebaseScannerTests(unittest.TestCase):
         self.assertIn("--- src/App.jsx ---", context)
 
 
+class BuildTestPlanDeduplicationTests(unittest.TestCase):
+    def test_build_test_plan_deduplicates_fragments_and_www(self):
+        pages = [
+            {
+                "page_url": "https://example.com/",
+                "title": "Home Page",
+                "headings": ["h1: Home"],
+                "links": [],
+                "forms": [],
+                "meta_tags": {},
+                "html_snippet": "<html>home</html>",
+                "status_code": 200,
+            },
+            {
+                "page_url": "https://www.example.com/",
+                "title": "Home Page (WWW)",
+                "headings": ["h1: Home"],
+                "links": [],
+                "forms": [],
+                "meta_tags": {},
+                "html_snippet": "<html>home</html>",
+                "status_code": 200,
+            },
+            {
+                "page_url": "https://example.com/#contact",
+                "title": "Home Page (Contact)",
+                "headings": ["h1: Home"],
+                "links": [],
+                "forms": [],
+                "meta_tags": {},
+                "html_snippet": "<html>home</html>",
+                "status_code": 200,
+            },
+            {
+                "page_url": "https://example.com/about",
+                "title": "About Us",
+                "headings": ["h1: About"],
+                "links": [],
+                "forms": [],
+                "meta_tags": {},
+                "html_snippet": "<html>about</html>",
+                "status_code": 200,
+            },
+        ]
+
+        result = build_test_plan("https://example.com", pages, {})
+        
+        # Deduplicated output should only contain Home Page (once) and About Us (once).
+        page_titles = [uc["title"] for uc in result["use_cases"]]
+        
+        # Verify that we don't have multiple pages for Example/Home
+        home_cases = [t for t in page_titles if "Home Page" in t]
+        about_cases = [t for t in page_titles if "About Us" in t]
+        
+        self.assertEqual(len(home_cases), 1, f"Expected 1 Home page use case, got {home_cases}")
+        self.assertEqual(len(about_cases), 1, f"Expected 1 About Us use case, got {about_cases}")
+
+
 if __name__ == "__main__":
     unittest.main()
